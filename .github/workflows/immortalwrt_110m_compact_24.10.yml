@@ -208,7 +208,7 @@ jobs:
     
     - name: Configuration Customization - Build_ax6000_immortalwrt_110m_compact_24.10
       env:
-        CONFIG_FILE: 'ax6000_immortalwrt_110m_compact.config'
+        CONFIG_FILE: 'ax6000_110m.config'
       run: |
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE /builder/openwrt/.config
         chmod +x ./customize_immortalwrt.sh && ./customize_immortalwrt.sh
@@ -235,7 +235,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
-        name: ax6000_immortalwrt_110m_compact_24.10
+        name: ax6000_110m_24.10
         path: /builder/openwrt/bin
         
     - name: Generate build date tag
@@ -249,7 +249,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ env.BUILD_DATE }}
-        name: RedmiAX6000_110m_Compact_24.10_${{ env.BUILD_DATE }}
+        name: RedmiAX6000_110m_24.10_${{ env.BUILD_DATE }}
         generate_release_notes: true
         files: |
           /builder/openwrt/bin/targets/mediatek/filogic/*.bin
