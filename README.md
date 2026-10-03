@@ -36,7 +36,7 @@
 | 默认主题 | `bootstrap` | **`Argon`** |
 | 2.4G SSID | `Redmi-2.4G` | **`Redmi_805D`** |
 | 5G SSID | `Redmi-5G` | **`Redmi_805D_5G`** |
-| Wi-Fi 密码 | `qwer1234` | **自行设置** |
+| Wi-Fi 密码 | `qwer1234` | **12345678** |
 
 ---
 
@@ -62,7 +62,7 @@
 | 默认密码 |  **首次登录必须设置**（固件出厂不带密码） |
 | 2.4G Wi-Fi | `Redmi_805D`，WPA2-PSK，加密算法**自动协商**（`psk2`） |
 | 5G Wi-Fi | `Redmi_805D_5G`，WPA2-PSK，**强制 AES/CCMP**（`psk2+ccmp`） |
-| Wi-Fi 密码 | 自行设置 |
+| Wi-Fi 密码 | 12345678 |
 | 国家 / 区域 | `CN` |
 
 首次登录后请立即设置管理密码，并建议修改 Wi-Fi 密码。
