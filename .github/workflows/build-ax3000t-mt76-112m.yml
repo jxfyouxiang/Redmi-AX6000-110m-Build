@@ -1,0 +1,280 @@
+name: Build AX3000T 112M (ImmortalWrt official + mt76)
+
+# 小米 AX3000T，yuzhii / hanwckf MTK U-Boot 的 "immortalwrt-112m" 大分区布局，
+# 但使用 ImmortalWrt 官方源码 + 开源 mt76 驱动（不用 MTK 闭源 mt_wifi）。
+#
+# 产物：*-squashfs-factory.bin —— 一个纯 UBI 镜像，可在现有 U-Boot 的
+#       WebUI 更新页面直接刷入，不需要更换 bootloader。
+#
+# 需要的仓库文件（本 workflow 与 AX6000 的编译流程互不干扰）：
+#   ax3000t-mt76-112m/customize_ax3000t_112m.sh
+#   ax3000t-mt76-112m/ax3000t-mt76-112m.config
+#   .github/workflows/build-ax3000t-mt76-112m.yml   (本文件)
+#
+# ===================== 两个曾经踩过的坑 =====================
+# 【坑 1】步骤顺序
+#   maximize-build-space 会把一个新卷挂到 build-mount-path 上，
+#   在那之前 checkout 下来的内容会被整个遮住（不是删掉，是看不见了）。
+#   所以它必须是第一步，checkout 必须在它之后。
+#
+# 【坑 2】必须装 feeds
+#   immortalwrt/immortalwrt 只是核心仓，luci / argon / 各种插件都在
+#   独立的 feeds 仓（packages、luci、routing、telephony）里。
+#   不跑 ./scripts/feeds update -a && ./scripts/feeds install -a 的话，
+#   CONFIG_PACKAGE_luci-* 会被 make defconfig 静默丢掉，最后卡在
+#   package/install：
+#     pkg_hash_check_unresolved: cannot find dependency luci for default-settings
+#     make[2]: *** [package/Makefile:99: package/install] Error 255
+#   白白烧掉两个多小时。
+# ============================================================
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [ax3000t]        # 只认这一种事件类型，不会被 AX6000 的 dispatch 带跑
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  DEVICE_DIR: ax3000t-mt76-112m
+  CONFIG_FILE: ax3000t-mt76-112m/ax3000t-mt76-112m.config
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      # ---------- 1. 先扩空间（必须在 checkout 之前）----------
+      - name: 释放构建空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          overprovision-lvm: 'true'
+          build-mount-path: '/builder'
+
+      - name: 准备构建目录
+        run: |
+          sudo mkdir -p /builder
+          sudo chown -R runner:runner /builder
+          df -hT
+
+      # ---------- 2. 再检出仓库 ----------
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 确认本机型的文件都在（要失败就早点失败）
+        run: |
+          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE"
+          test -f "$GITHUB_WORKSPACE/$DEVICE_DIR/customize_ax3000t_112m.sh" \
+            || { echo "::error::找不到 $DEVICE_DIR/customize_ax3000t_112m.sh，仓库里没有这个文件"; exit 1; }
+          test -f "$GITHUB_WORKSPACE/$CONFIG_FILE" \
+            || { echo "::error::找不到 $CONFIG_FILE，仓库里没有这个文件"; exit 1; }
+          echo "✅ 仓库文件齐全"
+
+      # ---------- 3. 装依赖、拉源码 ----------
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
+            gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
+            libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c \
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+            xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "Asia/Shanghai"
+
+      - name: 克隆 ImmortalWrt 官方源码
+        run: |
+          git clone -b $REPO_BRANCH --single-branch --filter=blob:none $REPO_URL /builder/openwrt
+          cd /builder/openwrt
+          git log -1 --format='源码版本: %h  %ad  %s' --date=short
+          df -hT /builder
+
+      # ---------- 4. 装 feeds（漏了这步就会像上次一样倒在 package/install）----------
+      - name: 更新并安装 feeds
+        run: |
+          cd /builder/openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          echo "::group::feeds 目录自检"
+          ls -la package/feeds/
+          for d in packages luci; do
+            [ -d "package/feeds/$d" ] || { echo "::error::package/feeds/$d 不存在，feeds 没装好"; exit 1; }
+          done
+          for p in luci luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-commands; do
+            find package/feeds -maxdepth 3 -type d -name "$p" | grep -q . \
+              || { echo "::error::feeds 里找不到 $p"; exit 1; }
+            echo "✅ $p"
+          done
+          echo "::endgroup::"
+
+      # ---------- 5. 打补丁、写配置 ----------
+      - name: 应用 112M 大分区补丁
+        run: |
+          cp "$GITHUB_WORKSPACE/$DEVICE_DIR/customize_ax3000t_112m.sh" /builder/openwrt/
+          chmod +x /builder/openwrt/customize_ax3000t_112m.sh
+          cd /builder/openwrt
+          ./customize_ax3000t_112m.sh
+
+      - name: 写入配置
+        run: |
+          cd /builder/openwrt
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" /tmp/fragment.config
+          cat /tmp/fragment.config >> .config
+          # 清掉可能存在的 BOM / CRLF，避免 defconfig 解析失败
+          sed -i '1s/^\xEF\xBB\xBF//' .config
+          sed -i 's/\r$//' .config
+          make defconfig
+
+      - name: 校验配置（关键断言，任何一条不过就中止）
+        run: |
+          cd /builder/openwrt
+          fail() { echo "::error::$1"; exit 1; }
+
+          echo "::group::选中的机型"
+          grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE|mediatek_filogic_DEVICE_xiaomi)' .config || true
+          echo "::endgroup::"
+
+          echo "::group::WiFi 驱动"
+          grep -E '^CONFIG_PACKAGE_(kmod-mt7915e|kmod-mt7981-firmware|mt7981-wo-firmware)' .config || true
+          echo "::endgroup::"
+
+          echo "::group::界面相关"
+          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-argon-config|luci-app-ttyd|luci-app-commands|luci-i18n-base-zh-cn)=' .config || true
+          echo "::endgroup::"
+
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t-mtkuboot=y' .config \
+            || fail "112M 机型没被选中，检查补丁是否成功"
+
+          grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y' .config \
+            || fail "开源 mt76 驱动未选中，编出来会没有 WiFi，中止"
+
+          if grep -q '^CONFIG_PACKAGE_kmod-mt_wifi=y' .config; then
+            fail "检测到闭源 kmod-mt_wifi 被选中，这与本方案冲突"
+          fi
+
+          # feeds 没装好时，下面这些会被 make defconfig 静默丢掉。
+          # 必须在这里拦住，否则要等两个多小时才在 package/install 阶段报错。
+          for c in luci luci-theme-argon luci-app-argon-config wpad-openssl luci-i18n-base-zh-cn; do
+            grep -q "^CONFIG_PACKAGE_$c=y" .config \
+              || fail "CONFIG_PACKAGE_$c 没被选中 —— 多半是 feeds 没装好，别往下编了"
+          done
+
+          echo "✅ 配置断言全部通过"
+
+      # ---------- 6. 编译 ----------
+      - name: 下载源码包
+        run: |
+          cd /builder/openwrt
+          make download -j8
+          find dl -type f -size -1k | grep . && { echo "::error::存在下载不完整的文件"; exit 1; } || true
+          df -hT /builder
+
+      - name: 编译
+        run: |
+          cd /builder/openwrt
+          set +e
+          make -j$(nproc) > /tmp/build.log 2>&1
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "::warning::并行编译失败 (rc=$RC)，改用 make -j1 V=s 重试并输出详细日志"
+            make -j1 V=s >> /tmp/build.log 2>&1
+            RC=$?
+          fi
+          echo "make 最终返回码 = $RC"
+          df -hT /builder
+
+          if [ $RC -ne 0 ]; then
+            echo "::group::编译日志里的错误行"
+            grep -nE 'Error [0-9]+|error:|No space left|Cannot install|unresolved|Collected errors' /tmp/build.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::编译日志尾部 200 行"
+            tail -n 200 /tmp/build.log
+            echo "::endgroup::"
+            exit $RC
+          fi
+
+      - name: 失败时保留完整编译日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+
+      # ---------- 7. 校验产物 ----------
+      - name: 校验产物（确认是能被现有 U-Boot 启动的裸 UBI 镜像）
+        run: |
+          cd /builder/openwrt
+          set -e
+          echo "::group::产物列表"
+          ls -la bin/targets/mediatek/filogic/
+          echo "::endgroup::"
+
+          F=$(ls bin/targets/mediatek/filogic/*mtkuboot*factory.bin 2>/dev/null | head -n1)
+          [ -n "$F" ] || { echo "::error::没有生成 factory.bin"; exit 1; }
+
+          MAGIC=$(head -c4 "$F" | xxd -p)
+          echo "factory.bin = $F"
+          echo "头 4 字节 = $MAGIC  (期望 55424923 = \"UBI#\")"
+          [ "$MAGIC" = "55424923" ] \
+            || { echo "::error::产物不是裸 UBI 镜像，U-Boot 不会认"; exit 1; }
+
+          SZ=$(stat -c%s "$F")
+          PEB=131072
+          echo "大小 = $SZ 字节, $((SZ % PEB)) = 剩余 (期望 0)"
+          [ $((SZ % PEB)) -eq 0 ] \
+            || { echo "::error::大小不是 128K PEB 的整数倍"; exit 1; }
+
+          echo "✅ 产物格式与当前 U-Boot 完全匹配"
+
+      - name: 打包产物
+        run: |
+          cd /builder/openwrt
+          mkdir -p /tmp/out
+          cp bin/targets/mediatek/filogic/*mtkuboot*.bin  /tmp/out/ 2>/dev/null || true
+          cp bin/targets/mediatek/filogic/*.manifest      /tmp/out/ 2>/dev/null || true
+          cp bin/targets/mediatek/filogic/*.json          /tmp/out/ 2>/dev/null || true
+          ls -la /tmp/out
+          # 记录用了哪些 WiFi 相关包
+          grep -E 'mt76|mt7915|mt7981|wpad' bin/targets/mediatek/filogic/*.manifest > /tmp/out/WIFI-PACKAGES.txt || true
+          cat /tmp/out/WIFI-PACKAGES.txt || true
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ax3000t-mt76-112m
+          path: /tmp/out/*
+          if-no-files-found: error
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: AX3000T_mt76_112m_${{ github.run_number }}
+          name: AX3000T 官方源码+mt76 112M大分区 ${{ github.run_number }}
+          body: |
+            小米 AX3000T，ImmortalWrt 官方源码 (openwrt-24.10)，**开源 mt76** 驱动，
+            yuzhii/hanwckf MTK U-Boot 的 **immortalwrt-112m** 大分区布局。
+
+            刷入方式：**不需要换 bootloader**。进入现有 U-Boot 的 WebUI 更新页面，
+            直接刷 `*-squashfs-factory.bin`。
+
+            产物已自动校验：头 4 字节为 `UBI#`，且文件大小为 128K 的整数倍。
+          files: /tmp/out/*
+          draft: false
+          prerelease: false
