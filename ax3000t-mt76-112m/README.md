@@ -112,12 +112,48 @@ Actions → `Build AX3000T 112M (ImmortalWrt official + mt76)` → Run workflow�
 本 workflow 只监听 `workflow_dispatch` 与 `repository_dispatch[ax3000t]`，不带 `push` 触发，
 所以改动仓库**不会**顺带跑起 AX6000 的编译，两个机型的流程互不干扰。
 
-编译流程里有两道自动断言：
+### 四道自动断言（都放在烧时间的编译之前）
 
-1. `make defconfig` 之后：必须选中 `DEVICE_xiaomi_mi-router-ax3000t-mtkuboot`
-   且 `CONFIG_PACKAGE_kmod-mt7915e=y`，并且不能出现 `kmod-mt_wifi`。
-2. 编译之后：`factory.bin` 头 4 字节必须是 `55424923`（`UBI#`），
-   且文件大小必须是 131072 的整数倍。**不满足就失败，不会放出刷不进去的固件。**
+设计原则：**让失败发生在几分钟内，而不是两个多小时之后。**
+
+| 时机 | 断言 |
+| :--- | :--- |
+| 检出仓库后 | `customize_ax3000t_112m.sh` 与 `.config` 片段都在仓库里 |
+| feeds 装完后 | `package/feeds/{packages,luci}` 存在；`luci-theme-argon`、`luci-app-argon-config`、`luci-app-ttyd`、`luci-app-commands`、`modules/luci-base` 都能 `[ -e ]` 到 |
+| `make defconfig` 后 | 选中 `DEVICE_xiaomi_mi-router-ax3000t-mtkuboot`；`kmod-mt7915e` 选中；`kmod-mt_wifi` 不得出现；`luci-theme-argon` / `luci-app-argon-config` / `luci-app-ttyd` / `luci-app-commands` / `luci-i18n-base-zh-cn` / `wpad-openssl` 必须 `=y` |
+| 编译之后 | `factory.bin` 头 4 字节必须是 `55424923`（`UBI#`），且大小是 131072 的整数倍。**不满足就失败，不会放出刷不进去的固件。** |
+
+### 这个 workflow 踩过的坑（别踩回去）
+
+1. **`maximize-build-space` 必须排在 `actions/checkout` 之前。**
+   它会把一个新卷挂到 `build-mount-path` 上，之前 checkout 下来的内容会被整个遮住
+   （不是删掉，是看不见了）。所以它排第一步，checkout 排它之后。
+2. **必须跑 `./scripts/feeds update -a && ./scripts/feeds install -a`。**
+   `immortalwrt/immortalwrt` 只是核心仓，LuCI / Argon 都在独立的 feeds 仓里。
+   漏了这步，`CONFIG_PACKAGE_luci-*` 会被 `make defconfig` **静默丢掉**，
+   最后卡死在 `package/install`，白烧两个多小时。
+3. **`./scripts/feeds install` 建的是符号链接，不是目录。**
+   检查只能用 `[ -e ]`（会跟随符号链接）；用 `find -type d` 一个都找不到
+   （符号链接的类型是 `l` 不是 `d`）。
+4. **不要拿"推导出来的符号"当门禁。**
+   `CONFIG_PACKAGE_luci` 只是 `default-settings-chn` 传递依赖出来的，
+   不保证在 `.config` 里写成 `=y`。断言必须钉在**本片段里显式写了、
+   且上游确实存在**的包上。这条已经做成机械校验（见下）。
+
+### 关于编译依赖
+
+依赖清单对着 ImmortalWrt 官方的 `init_build_environment.sh` 补齐了
+`fakeroot / quilt / sharutils / jq / genisoimage`，并补上了官方脚本里那行
+`/usr/include/asm` 软链（少了它编某些内核模块会报 `asm/types.h` 找不到）。
+
+顺带说明：**依赖不是前三次失败的原因** —— 失败的第二轮已经用更早那份清单
+把工具链、内核和全部 kmod 都编出来了，它是倒在 `package/install` 的 feeds 缺包上。
+
+### 离线自检脚本
+
+`tools/verify_patch.py` 和 `tools/verify_all.py` 可以在**不联网、不跑 CI** 的情况下
+把上面每一条断言都验一遍（前者用真实的 upstream `filogic.mk` 复现补丁逻辑，
+后者解析 workflow YAML 并交叉核对 config 片段）。改动这几个文件之后先跑它们。
 
 ## 刷机
 

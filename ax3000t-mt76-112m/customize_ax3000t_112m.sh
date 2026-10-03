@@ -87,6 +87,14 @@ echo "[1/3] 已写入 $DTS_DIR/$DTS_NAME.dts"
 if grep -q "Device/xiaomi_mi-router-ax3000t-mtkuboot" "$FLOGIC"; then
 	echo "[2/3] 机型定义已存在，跳过"
 else
+	# 插入位置靠这一行锚定。上游结构一变，awk 会「什么都不插」却不报错，
+	# 所以要在这里直接拦住，而不是等很久以后在别的地方报出来。
+	if ! grep -q '^TARGET_DEVICES += xiaomi_mi-router-ax3000t$' "$FLOGIC"; then
+		echo "错误：$FLOGIC 里找不到锚点行 'TARGET_DEVICES += xiaomi_mi-router-ax3000t'"
+		echo "      上游源码结构可能变了，请人工确认后再改本脚本。"
+		exit 1
+	fi
+
 	cat > /tmp/112m-device.$$.mk <<'MK_EOF'
 
 # ---- AX3000T 112M 大分区（yuzhii/hanwckf MTK U-Boot）+ 开源 mt76 ----
@@ -123,21 +131,38 @@ fi
 
 # ---------------------------------------------------------------------------
 # 步骤 3/3：自检 —— 任何一项不过就中止，避免编出一个刷不进去的固件
+#
+# 注意：下面检查「机型定义块内部」的那几项，都是先把块单独截出来再 grep。
+# 因为 filogic.mk 里别的机型（stock AX3000T、AX6000……）本来就有
+# kmod-mt7915e / IMAGE_SIZE := 这些字样，直接对整文件 grep 会误判成通过。
 # ---------------------------------------------------------------------------
 fail() { echo "自检失败：$1"; exit 1; }
 
-grep -q "define Device/xiaomi_mi-router-ax3000t-mtkuboot" "$FLOGIC" \
-	|| fail "filogic.mk 中没有机型定义"
-grep -q "^TARGET_DEVICES += xiaomi_mi-router-ax3000t-mtkuboot" "$FLOGIC" \
-	|| fail "机型未注册到 TARGET_DEVICES"
+grep -q '^define Device/xiaomi_mi-router-ax3000t-mtkuboot$' "$FLOGIC" \
+	|| fail "filogic.mk 中没有机型定义（awk 没插进去？检查锚点行是否还在）"
+grep -q '^TARGET_DEVICES += xiaomi_mi-router-ax3000t-mtkuboot$' "$FLOGIC" \
+	|| fail "机型没注册到 TARGET_DEVICES（少了这行 make defconfig 会静默丢掉机型）"
+
+BLOCK=$(awk '/^define Device\/xiaomi_mi-router-ax3000t-mtkuboot$/{f=1} f{print} f&&/^endef$/{exit}' "$FLOGIC")
+[ -n "$BLOCK" ] || fail "截取机型定义块失败"
+
+echo "$BLOCK" | grep -q 'DEVICE_DTS := mt7981b-xiaomi-mi-router-ax3000t-mtkuboot' \
+	|| fail "机型块里 DEVICE_DTS 不对"
+echo "$BLOCK" | grep -q 'UBINIZE_OPTS := -E 5' \
+	|| fail "机型块里 UBINIZE_OPTS 不对（必须和 237 的布局完全一致）"
+echo "$BLOCK" | grep -q 'KERNEL_IN_UBI := 1' \
+	|| fail "机型块里没有 KERNEL_IN_UBI（U-Boot 读不到 kernel 卷）"
+echo "$BLOCK" | grep -q 'IMAGE_SIZE := 114688k' \
+	|| fail "机型块里 IMAGE_SIZE 不是 114688k（= 112 MiB）"
+echo "$BLOCK" | grep -q 'kmod-mt7915e' \
+	|| fail "机型块里没有开源 mt76 驱动"
+
+grep -q 'mt7981b-xiaomi-mi-router-ax3000t.dtsi' "$DTS_DIR/$DTS_NAME.dts" \
+	|| fail "DTS 没有 include 官方 .dtsi"
 grep -q '0x600000 0x7000000' "$DTS_DIR/$DTS_NAME.dts" \
 	|| fail "DTS 里 ubi 分区不是 0x600000 起、112 MiB"
 grep -q 'xiaomi,mi-router-ax3000t-mtkuboot' "$DTS_DIR/$DTS_NAME.dts" \
 	|| fail "DTS 里 compatible 不对（sysupgrade 会拒绝刷机）"
-grep -q 'IMAGE_SIZE := 114688k' "$FLOGIC" \
-	|| fail "IMAGE_SIZE 不是 112 MiB"
-grep -q 'kmod-mt7915e' "$FLOGIC" \
-	|| fail "没有选中开源 mt76 驱动"
 grep -q 'mediatek,nmbm' "$DTS_DIR/$DTS_NAME.dts" \
 	|| fail "DTS 里没有开 NMBM（NAND 坏块管理，必须要有）"
 
