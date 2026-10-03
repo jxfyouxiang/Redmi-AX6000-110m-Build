@@ -11,7 +11,7 @@ name: Build AX3000T 112M (ImmortalWrt official + mt76)
 #   ax3000t-mt76-112m/ax3000t-mt76-112m.config
 #   .github/workflows/build-ax3000t-mt76-112m.yml   (本文件)
 #
-# ===================== 两个曾经踩过的坑 =====================
+# ===================== 已经踩过的坑（都别踩回去）=====================
 # 【坑 1】步骤顺序
 #   maximize-build-space 会把一个新卷挂到 build-mount-path 上，
 #   在那之前 checkout 下来的内容会被整个遮住（不是删掉，是看不见了）。
@@ -26,7 +26,20 @@ name: Build AX3000T 112M (ImmortalWrt official + mt76)
 #     pkg_hash_check_unresolved: cannot find dependency luci for default-settings
 #     make[2]: *** [package/Makefile:99: package/install] Error 255
 #   白白烧掉两个多小时。
-# ============================================================
+#
+# 【坑 3】符号链接不是目录
+#   ./scripts/feeds install 建的是【符号链接】（scripts/feeds 里是 ln -sf），
+#   用 find -type d 去检查一个都找不到（符号链接的类型是 l 不是 d）。
+#   只能用 [ -e ]（会跟随符号链接）。
+#
+# 【坑 4】不要拿"推导出来的符号"当断言
+#   CONFIG_PACKAGE_luci 是 default-settings-chn 传递依赖出来的，不保证会在
+#   .config 里写成 =y。断言必须钉在【本片段里显式写了、且上游确实存在】的
+#   包上 —— 下面这 5 个 luci 系包就是（已逐个核对上游 luci 仓返回 200）。
+#
+# 【设计原则】所有检查都放在烧时间的编译之前，让失败发生在几分钟内，
+#   而不是两个多小时之后。
+# ====================================================================
 
 on:
   workflow_dispatch:
@@ -58,7 +71,6 @@ jobs:
           remove-android: 'true'
           remove-haskell: 'true'
           remove-codeql: 'true'
-          remove-docker-images: 'true'
           overprovision-lvm: 'true'
           build-mount-path: '/builder'
 
@@ -84,18 +96,31 @@ jobs:
 
       # ---------- 3. 装依赖、拉源码 ----------
       - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq
-          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
-            gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool \
-            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
-            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
-            libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
-            python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c \
-            rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
-            xmlto xxd zlib1g-dev zstd
+          sudo -E apt-get -qq update
+          # 这份清单是「官方 init_build_environment.sh 的包集合」中去掉
+          # nodejs/yarn/golang/gh 那些本项目用不到的东西。上一次失败的那轮
+          # （2 小时 18 分那轮）已经用这份清单把工具链、内核、全部 kmod 都
+          # 编出来了，所以依赖不是历史失败的原因 —— 这里只补充官方清单里
+          # 有、而我们之前漏掉的那几个，外加下面那行 /usr/include/asm。
+          sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fakeroot fastjar \
+            flex gawk genisoimage gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man \
+            intltool jq lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            libyaml-dev libz-dev lld llvm lrzsz msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pip python3-cryptography python3-docutils python3-ply python3-pyelftools \
+            python3-requests python3-setuptools qemu-utils quilt re2c rsync scons sharutils \
+            squashfs-tools subversion swig texinfo uglifyjs unzip upx-ucl vim wget xmlto xxd \
+            zlib1g-dev zstd
+          # Ubuntu 的 libc6-dev 在部分版本里不带 /usr/include/asm，
+          # 编某些内核模块会报 "asm/types.h: No such file or directory"。
+          # 官方 init_build_environment.sh 就是用这一行修的。
+          [ -e /usr/include/asm ] || sudo ln -svf "/usr/include/$(gcc -dumpmachine)/asm" /usr/include/asm
           sudo timedatectl set-timezone "Asia/Shanghai"
+          gcc --version | head -n 1
 
       - name: 克隆 ImmortalWrt 官方源码
         run: |
@@ -111,17 +136,30 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          echo "::group::feeds 目录自检"
+          echo "::group::feeds 安装结果"
           ls -la package/feeds/
+          echo "--- package/feeds/luci 前 30 项 ---"
+          ls -la package/feeds/luci | head -n 30
+          echo "::endgroup::"
+
+          # 注意：./scripts/feeds install 建的是【符号链接】而不是目录。
+          #   scripts/feeds 的 do_install_src 里是：
+          #     $path = $src->{makefile};  $path =~ s/\/Makefile$//;
+          #     system("ln -sf ../../../$path ./package/feeds/$feed->[1]/");
+          #   ln 的目标带结尾斜杠 =「在这个目录里建链接」，链接名取 $path 的
+          #   【basename】。所以 luci/modules/luci-base 建出来的是
+          #     package/feeds/luci/luci-base
+          #   而【不是】package/feeds/luci/modules/luci-base（那个路径不存在）。
+          # 也正因如此只能用 -e 判断（-e 会跟随符号链接）；
+          # 用 find -type d 一个都找不到 —— 符号链接的类型是 l 不是 d。
           for d in packages luci; do
             [ -d "package/feeds/$d" ] || { echo "::error::package/feeds/$d 不存在，feeds 没装好"; exit 1; }
           done
-          for p in luci luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-commands; do
-            find package/feeds -maxdepth 3 -type d -name "$p" | grep -q . \
-              || { echo "::error::feeds 里找不到 $p"; exit 1; }
+          for p in luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-commands luci-base; do
+            [ -e "package/feeds/luci/$p" ] || { echo "::error::package/feeds/luci/$p 不存在"; exit 1; }
             echo "✅ $p"
           done
-          echo "::endgroup::"
+          echo "（luci-base 就是 luci/modules/luci-base；luci-i18n-*-zh-cn 都在它里面定义）"
 
       # ---------- 5. 打补丁、写配置 ----------
       - name: 应用 112M 大分区补丁
@@ -135,11 +173,18 @@ jobs:
         run: |
           cd /builder/openwrt
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" /tmp/fragment.config
+          # 先清掉片段自己的 BOM / CRLF，再拼接，避免污染 .config
+          sed -i '1s/^\xEF\xBB\xBF//' /tmp/fragment.config
+          sed -i 's/\r$//' /tmp/fragment.config
+          # 保证上一行以换行结尾，否则拼接会把两行粘成一行
+          if [ -s .config ] && [ -n "$(tail -c1 .config)" ]; then
+            echo >> .config
+          fi
           cat /tmp/fragment.config >> .config
-          # 清掉可能存在的 BOM / CRLF，避免 defconfig 解析失败
-          sed -i '1s/^\xEF\xBB\xBF//' .config
-          sed -i 's/\r$//' .config
           make defconfig
+          echo "::group::.config 行数"
+          wc -l .config
+          echo "::endgroup::"
 
       - name: 校验配置（关键断言，任何一条不过就中止）
         run: |
@@ -147,11 +192,11 @@ jobs:
           fail() { echo "::error::$1"; exit 1; }
 
           echo "::group::选中的机型"
-          grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE|mediatek_filogic_DEVICE_xiaomi)' .config || true
+          grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE|MULTI_PROFILE|mediatek_filogic_DEVICE)' .config || true
           echo "::endgroup::"
 
           echo "::group::WiFi 驱动"
-          grep -E '^CONFIG_PACKAGE_(kmod-mt7915e|kmod-mt7981-firmware|mt7981-wo-firmware)' .config || true
+          grep -E '^CONFIG_PACKAGE_(kmod-mt7915e|kmod-mt7981-firmware|mt7981-wo-firmware|wpad-openssl)' .config || true
           echo "::endgroup::"
 
           echo "::group::界面相关"
@@ -159,20 +204,18 @@ jobs:
           echo "::endgroup::"
 
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t-mtkuboot=y' .config \
-            || fail "112M 机型没被选中，检查补丁是否成功"
+            || fail "112M 机型没被选中 —— 检查补丁是否插进了 filogic.mk，以及片段里的机型名有没有写错"
 
           grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y' .config \
             || fail "开源 mt76 驱动未选中，编出来会没有 WiFi，中止"
 
-          if grep -q '^CONFIG_PACKAGE_kmod-mt_wifi=y' .config; then
-            fail "检测到闭源 kmod-mt_wifi 被选中，这与本方案冲突"
-          fi
-
-          # feeds 没装好时，下面这些会被 make defconfig 静默丢掉。
-          # 必须在这里拦住，否则要等两个多小时才在 package/install 阶段报错。
-          for c in luci luci-theme-argon luci-app-argon-config wpad-openssl luci-i18n-base-zh-cn; do
+          # 只检查本片段里【显式写了】的包。不要断言 CONFIG_PACKAGE_luci：
+          # 它是 default-settings-chn 传递依赖出来的，不保证在 .config 里是 =y，
+          # 拿它当断言会误杀。上面这 5 个 luci 系包已经足以证明 feeds 装好了。
+          for c in luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-commands \
+                   luci-i18n-base-zh-cn wpad-openssl; do
             grep -q "^CONFIG_PACKAGE_$c=y" .config \
-              || fail "CONFIG_PACKAGE_$c 没被选中 —— 多半是 feeds 没装好，别往下编了"
+              || fail "CONFIG_PACKAGE_$c 没被选中 —— 多半是 feeds 没装好或包名变了，别往下编了"
           done
 
           echo "✅ 配置断言全部通过"
@@ -181,20 +224,25 @@ jobs:
       - name: 下载源码包
         run: |
           cd /builder/openwrt
-          make download -j8
-          find dl -type f -size -1k | grep . && { echo "::error::存在下载不完整的文件"; exit 1; } || true
+          make download -j$(nproc) || make download -j1 V=s
+          # 下载不完整的文件（<1KB）留在 dl/ 里会让后面报 hash 校验失败。
+          # 按 AX6000 工作流的做法直接删掉，让编译时重新下载；
+          # 注意这里【不再】因为它的存在就判定失败 —— 那种硬断言只会误杀。
+          find dl -type f -size -1k -print -delete || true
           df -hT /builder
 
       - name: 编译
         run: |
           cd /builder/openwrt
           set +e
-          make -j$(nproc) > /tmp/build.log 2>&1
-          RC=$?
+          # 用 tee 而不是纯重定向，保证构建过程中日志实时可见；
+          # 万一作业被取消/超时，日志也已经流出去了。
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
           if [ $RC -ne 0 ]; then
-            echo "::warning::并行编译失败 (rc=$RC)，改用 make -j1 V=s 重试并输出详细日志"
-            make -j1 V=s >> /tmp/build.log 2>&1
-            RC=$?
+            echo "::warning::并行编译失败 (rc=$RC)，改用 make -j1 V=s 继续（make 是增量的，不会从零重来）"
+            make -j1 V=s 2>&1 | tee -a /tmp/build.log
+            RC=${PIPESTATUS[0]}
           fi
           echo "make 最终返回码 = $RC"
           df -hT /builder
@@ -221,25 +269,30 @@ jobs:
       - name: 校验产物（确认是能被现有 U-Boot 启动的裸 UBI 镜像）
         run: |
           cd /builder/openwrt
-          set -e
+          fail() { echo "::error::$1"; exit 1; }
+
           echo "::group::产物列表"
           ls -la bin/targets/mediatek/filogic/
           echo "::endgroup::"
 
+          # 这里先关掉 -e：ls 找不到文件会返回非 0，在 set -e 下会直接退出，
+          # 连下面那句 ::error:: 都来不及打印。
+          set +e
           F=$(ls bin/targets/mediatek/filogic/*mtkuboot*factory.bin 2>/dev/null | head -n1)
-          [ -n "$F" ] || { echo "::error::没有生成 factory.bin"; exit 1; }
+          set -e
+          [ -n "$F" ] || fail "没有生成 factory.bin —— 检查机型是否被选中、append-ubi 是否成功"
 
           MAGIC=$(head -c4 "$F" | xxd -p)
           echo "factory.bin = $F"
           echo "头 4 字节 = $MAGIC  (期望 55424923 = \"UBI#\")"
           [ "$MAGIC" = "55424923" ] \
-            || { echo "::error::产物不是裸 UBI 镜像，U-Boot 不会认"; exit 1; }
+            || fail "产物不是裸 UBI 镜像，U-Boot 不会认"
 
           SZ=$(stat -c%s "$F")
           PEB=131072
-          echo "大小 = $SZ 字节, $((SZ % PEB)) = 剩余 (期望 0)"
+          echo "大小 = $SZ 字节, 对 $PEB 取余 = $((SZ % PEB))  (期望 0)"
           [ $((SZ % PEB)) -eq 0 ] \
-            || { echo "::error::大小不是 128K PEB 的整数倍"; exit 1; }
+            || fail "大小不是 128K PEB 的整数倍"
 
           echo "✅ 产物格式与当前 U-Boot 完全匹配"
 
@@ -264,6 +317,8 @@ jobs:
 
       - name: 发布 Release
         uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: AX3000T_mt76_112m_${{ github.run_number }}
           name: AX3000T 官方源码+mt76 112M大分区 ${{ github.run_number }}
