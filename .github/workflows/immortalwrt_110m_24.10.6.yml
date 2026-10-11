@@ -1,0 +1,368 @@
+# =============================================================================
+# 红米 AX6000 (Redmi Router AX6000) · ImmortalWrt v24.10.6 · hanwckf 110M 大分区
+#
+# 这份工作流相对旧版（lixiang2017 的 immortalwrt_110m_compact_24.10.yml）
+# 改了什么、以及为什么必须改：
+#
+#  A. 源码钉死在 v24.10.6（commit 5fa11a1b…）
+#     旧版 clone openwrt-24.10 分支 ⇒ 每次编译拿到的内核版本 / 内核配置 /
+#     kmod 包的 KCONFIG 都可能不同 ⇒ 内核 ABI 哈希（vermagic）漂移。
+#     为什么这很致命：opkg 的依赖是 kernel (=6.6.133~a8b93917…-r1)，
+#     固件里自己编的 .ko 与官方 kmods 池必须"内核版本 + 哈希"双双相等才能混用。
+#     钉 tag 的额外好处：v24.10.6 的 feeds.conf.default 里 4 个 feed 全都自带
+#     ^commit 钉死（packages^97af1398 / luci^adb3df4d / routing^ae3329ee /
+#     telephony^92892fa2）⇒ feeds 也不会漂。所以不要去改 feeds.conf.default。
+#
+#  B. .config 改为从官方 config.buildinfo 派生（见 ax6000_110m_24.10.6.config）
+#     旧版手写 81 行 fragment ≈ 关掉了 CONFIG_ALL_KMODS
+#     ⇒ 数百个内核符号被写成 n ⇒ 内核配置与官方不同 ⇒ 哈希落到另一支
+#     ⇒ 官方 kmods 池全部不可用，硬装就是 net_generic() 空指针 panic。
+#     新版逐字保留官方 config 的设备/包选择，只做三处 delta
+#     （只勾 110M 一台、关掉 TARGET_ALL_PROFILES、加 16 个要装进固件的包）。
+#
+#  C. ABI 门（本文件最关键的新增步骤）
+#     先只编内核，读出实际 .vermagic 与官方 a8b93917… 对比，
+#     不一致就立刻停下（约 30 分钟出结果，而不是编了两个小时才发现）。
+#
+#  D. 顺手修掉的沉默失败点
+#     · 110M 补丁前置断言：上游 FIP 分区一旦不是 0x380000/0x200000 就报错，
+#       而不是让 0x580000 的起点静默重叠（那种重叠会直接变砖）
+#     · 去掉重复的 Install feeds（旧版 install -a 跑了两遍）
+#     · .config 用显式存在性校验 + cp（旧版 `[ -e $CONFIG_FILE ] && mv` 一旦
+#       路径不对就是静默 no-op，然后你会在编出来的固件里发现配置完全没生效）
+#     · defconfig 之后加 sanity check（设备数必须正好 1 台、ALL_KMODS 必须在…）
+#     · 去掉 `|| make -j1 V=s`：多线程失败后再单线程重编，必然撞 6 小时上限
+#     · 加 permissions / timeout-minutes / artifact 的 if: always()
+#     · Release 补挂 config.buildinfo 与整包 kmods（ABI 一致时它就是官方池的镜像）
+# =============================================================================
+
+name: immortalwrt_110m_24.10.6
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi_strict:
+        description: 'ABI 门：vermagic 与官方不一致时是否中止编译（true=中止）'
+        type: boolean
+        default: true
+  repository_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: v24.10.6
+  EXPECTED_KERNEL: '6.6.133'
+  EXPECTED_VERMAGIC: a8b93917f464536104594f27d870028d
+  CONFIG_FILE: ax6000_110m_24.10.6.config
+  CUSTOMIZE_SCRIPT: customize_immortalwrt_24.10.6.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    # 22.04 是上游一直用的镜像，maximize-build-space 的 /builder 空间腾挪也是按它测的。
+    # 注意它已被标记弃用（2027-04-17 下线），将来换 24.04 时 /builder 逻辑要重测。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+
+      - name: 腾出磁盘空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          overprovision-lvm: 'true'
+          build-mount-path: '/builder'
+
+      - name: 准备 /builder 目录
+        run: |
+          sudo mkdir -p /builder
+          sudo chown "$USER:$GROUPS" /builder
+          df -hT /builder
+
+      - name: 检出本仓库
+        uses: actions/checkout@v7
+
+      - name: 安装编译依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # 官方唯一的依赖安装脚本（immortalwrt/build-scripts）。它每次都会拉最新，
+          # 这是唯一无法冻结的外部输入；真要冻结就把它的内容抄进本仓库再执行。
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo apt-get -y autoremove --purge
+          sudo apt-get -y clean
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo timedatectl set-timezone Asia/Shanghai
+          sudo chown -R "$USER:$GROUPS" "$GITHUB_WORKSPACE"
+          df -hT /builder
+
+      - name: 克隆源码（钉死 v24.10.6）
+        working-directory: /builder
+        run: |
+          set -euo pipefail
+          git clone -b "$REPO_BRANCH" --single-branch --filter=blob:none "$REPO_URL" /builder/openwrt
+          cd /builder/openwrt
+          echo "== 实际检出的 commit =="
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "$HEAD_SHA"
+          git log -1 --format='%H %ci %s'
+          echo "== tag 指向的 commit（应当与上面相同）=="
+          git rev-parse "$REPO_BRANCH^{commit}"
+          # 这一条只是取证：tag 被人挪过就会警告（正常情况永远不该触发）
+          if [ "$HEAD_SHA" != "5fa11a1b5689154d296fdacf1e16a7abccb897b9" ]; then
+            echo "::warning::v24.10.6 指向的 commit 与预期 5fa11a1b5689154d296fdacf1e16a7abccb897b9 不同，请核对上游 tag 是否被移动"
+          fi
+          echo "== feeds.conf.default（自带 ^commit 钉死，不要改）=="
+          cat feeds.conf.default
+
+      - name: 应用 AX6000 110M 大分区补丁
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+
+          # 0. 前置断言：base 分区树必须仍然止于 0x580000，
+          #    110M 布局（crash 0x580000 / ubi 0x600000）正是接在它后面。
+          DTSI=target/linux/mediatek/dts/mt7986a-xiaomi-redmi-router-ax6000.dtsi
+          grep -q '0x380000 0x200000' "$DTSI" || {
+            echo "::error::$DTSI 里的 FIP 分区不再是 0x380000/0x200000，110M 布局的 0x580000 起点假设已失效，必须重新计算分区偏移后再刷机（硬套会变砖）"
+            exit 1
+          }
+
+          # 1. 在 filogic.mk 末尾追加 Device（红米AX6000 设备定义）
+          cat << 'EOF' >> target/linux/mediatek/image/filogic.mk
+
+          define Device/xiaomi_redmi-router-ax6000-110m
+            $(Device/xiaomi_redmi-router-ax6000-stock)
+            DEVICE_VARIANT := (hanwckf 110M layout)
+            DEVICE_DTS := mt7986a-xiaomi-redmi-router-ax6000-110m
+            SUPPORTED_DEVICES := xiaomi,redmi-router-ax6000
+            IMAGE_SIZE := 112640k
+            KERNEL_IN_UBI := 1
+            IMAGES := factory.bin sysupgrade.bin
+            IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
+            IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+          endef
+          TARGET_DEVICES += xiaomi_redmi-router-ax6000-110m
+          EOF
+
+          # 2. 创建全新的 immortalwrt 110m大分区 DTS 设备树文件
+          cat << 'EOF' > target/linux/mediatek/dts/mt7986a-xiaomi-redmi-router-ax6000-110m.dts
+          // SPDX-License-Identifier: (GPL-2.0 OR MIT)
+
+          /dts-v1/;
+          #include "mt7986a-xiaomi-redmi-router-ax6000.dtsi"
+
+          / {
+          	model = "Xiaomi Redmi Router AX6000 (hanwckf 110M layout)";
+          	compatible = "xiaomi,redmi-router-ax6000", "mediatek,mt7986a";
+          };
+
+          &spi_nand_flash {
+          	mediatek,nmbm;
+          	mediatek,bmt-max-ratio = <1>;
+          	mediatek,bmt-max-reserved-blocks = <64>;
+          };
+
+          &partitions {
+          	partition@580000 {
+          		label = "crash";
+          		reg = <0x580000 0x40000>;
+          		read-only;
+          	};
+
+          	partition@5c0000 {
+          		label = "crash_log";
+          		reg = <0x5c0000 0x40000>;
+          		read-only;
+          	};
+
+          	partition@600000 {
+          		label = "ubi";
+          		reg = <0x600000 0x6e00000>;
+          	};
+          };
+          EOF
+
+          # 3. 结果确认
+          grep -q 'Device/xiaomi_redmi-router-ax6000-110m' target/linux/mediatek/image/filogic.mk
+          test -f target/linux/mediatek/dts/mt7986a-xiaomi-redmi-router-ax6000-110m.dts
+          grep -n 'xiaomi_redmi-router-ax6000-110m' target/linux/mediatek/image/filogic.mk
+          echo "✅ AX6000 110M 大分区适配代码补丁应用成功！"
+
+      - name: 更新并安装 feeds
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config 并做定制
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+
+          # 1. 用官方 config.buildinfo 派生的 .config（缺失就报错，绝不静默跳过）
+          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
+            echo "::error::仓库根目录里找不到 $CONFIG_FILE"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+          cp -v "$GITHUB_WORKSPACE/$CONFIG_FILE" /builder/openwrt/.config
+
+          # 2. 定制脚本：默认 LAN IP / 主机名 / 默认主题 / uci-defaults 里的 WiFi 初值
+          #    （必须在 feeds install -a 之后跑，它要改 luci 集合的 Makefile）
+          cp -v "$GITHUB_WORKSPACE/$CUSTOMIZE_SCRIPT" /builder/openwrt/
+          chmod +x "./$CUSTOMIZE_SCRIPT"
+          "./$CUSTOMIZE_SCRIPT"
+
+          # 3. 展开成完整 .config
+          make defconfig
+
+          # 4. sanity check：任何一条不过，说明配置没按预期生效，立刻停
+          echo "== 选中的设备 =="
+          grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config
+          N=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config)
+          echo "选中设备数 = $N"
+          [ "$N" -eq 1 ] || { echo "::error::选中设备数不是 1（TARGET_ALL_PROFILES 没关掉？）"; exit 1; }
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_xiaomi_redmi-router-ax6000-110m=y' .config \
+            || { echo "::error::110M 设备没被选中（filogic.mk 补丁没生效？）"; exit 1; }
+          grep -q '^CONFIG_ALL_KMODS=y' .config \
+            || { echo "::error::ALL_KMODS 丢了 —— 内核 ABI 会与官方分家，这正是上一次 panic 的根因"; exit 1; }
+          grep -q '^CONFIG_TARGET_MULTI_PROFILE=y' .config \
+            || { echo "::error::MULTI_PROFILE 丢了"; exit 1; }
+          grep -q '^# CONFIG_TARGET_ALL_PROFILES is not set' .config \
+            || { echo "::error::TARGET_ALL_PROFILES 没关掉"; exit 1; }
+          for p in kmod-nft-queue kmod-nfnetlink-queue luci-theme-argon; do
+            grep -q "^CONFIG_PACKAGE_$p=y" .config || { echo "::error::$p 没被选中"; exit 1; }
+          done
+          echo "== 内核相关行数 =="
+          grep -c '^CONFIG_KERNEL_' .config
+          echo "== 明确装进固件的 kmod 数 =="
+          grep -cE '^CONFIG_PACKAGE_kmod-.*=y$' .config
+          echo "✅ .config 生成完毕"
+
+      - name: ABI 门 — 先只编内核，核对 vermagic
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+          grep '^CONFIG_KERNEL_' .config | LC_ALL=C sort | tee /builder/kernel-config-lines.txt | head -n 40
+          # 触发 Kernel/Configure ⇒ 写出 .vermagic（哈希的三条输入全在这里汇聚）
+          make -j$(nproc) target/linux/compile
+          VFILE=$(find build_dir -maxdepth 6 -name .vermagic | head -n1)
+          [ -n "$VFILE" ] || { echo "::error::没有找到 .vermagic"; exit 1; }
+          V=$(cat "$VFILE")
+          echo ".vermagic 文件 : $VFILE"
+          echo "实际 vermagic  : $V"
+          echo "官方 vermagic  : $EXPECTED_VERMAGIC  (内核 $EXPECTED_KERNEL)"
+          if [ "$V" = "$EXPECTED_VERMAGIC" ]; then
+            echo "✅ ABI 与官方一致 —— 官方 24.10.6 的 1067 个 kmod 可以直接 opkg 装"
+          else
+            echo "::warning::vermagic 与官方不一致 —— 官方 kmods 池不可用（硬装会 panic）"
+            echo "::warning::固件本身仍然能用，但插件只能全部用本次编译产物"
+            if [ "${{ inputs.abi_strict }}" != "false" ]; then
+              echo "::error::abi_strict=true，中止编译。请对比 /builder/kernel-config-lines.txt 与官方 config.buildinfo 的 CONFIG_KERNEL_* 行"
+              exit 1
+            fi
+          fi
+
+      - name: 下载所有源码包
+        working-directory: /builder/openwrt
+        run: |
+          set -uo pipefail
+          make download -j8 || make download -j1 V=s || true
+          echo "== 小于 1KB 的（= 下载失败）文件，列出来再删掉 =="
+          find dl -size -1024c -exec ls -l {} \; | tee /builder/dl-broken.txt
+          find dl -size -1024c -delete
+          echo "== dl 目录大小 =="
+          du -sh dl
+
+      - name: 编译固件
+        working-directory: /builder/openwrt
+        run: |
+          set -o pipefail
+          echo "$(nproc) 线程编译"
+          make -j$(nproc) 2>&1 | tee /builder/build.log
+
+      - name: 编译失败时打印日志尾部
+        if: failure()
+        run: |
+          tail -n 200 /builder/build.log || true
+
+      - name: 汇总产物（含 kmods 池与 config.buildinfo）
+        if: always()
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+          TDIR=$(find bin/targets -maxdepth 2 -mindepth 2 -type d | head -n1)
+          echo "target 目录: $TDIR"
+          ls -lh "$TDIR" || true
+          if [ -d "$TDIR/kmods" ]; then
+            echo "== kmods 包数 =="
+            find "$TDIR/kmods" -name '*.ipk' | wc -l
+            tar -czf /builder/ax6000-110m-kmods.tar.gz -C "$TDIR" kmods
+            ls -lh /builder/ax6000-110m-kmods.tar.gz
+          else
+            echo "::warning::没有 kmods 目录"
+          fi
+          cp -v "$TDIR/config.buildinfo" /builder/ 2>/dev/null || true
+          cp -v "$TDIR/profiles.json" /builder/ 2>/dev/null || true
+          echo "== 本次实际 .config 的 sha256 =="
+          sha256sum .config
+          cat "$TDIR"/*.vermagic 2>/dev/null || true
+          echo "== bin 目录大小 =="
+          du -sh bin
+
+      - name: 上传 artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ax6000-110m-24.10.6-${{ github.run_number }}
+          path: |
+            /builder/openwrt/bin/targets/mediatek/filogic/*.bin
+            /builder/openwrt/bin/targets/mediatek/filogic/*.itb
+            /builder/openwrt/bin/targets/mediatek/filogic/*.manifest
+            /builder/openwrt/bin/targets/mediatek/filogic/*.json
+            /builder/openwrt/bin/targets/mediatek/filogic/config.buildinfo
+            /builder/ax6000-110m-kmods.tar.gz
+            /builder/build.log
+            /builder/dl-broken.txt
+            /builder/kernel-config-lines.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 生成构建时间戳
+        if: success()
+        run: echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: 发布 Release
+        if: success()
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.BUILD_DATE }}
+          name: RedmiAX6000_110m_v24.10.6_${{ env.BUILD_DATE }}
+          generate_release_notes: false
+          body: |
+            红米 AX6000 · ImmortalWrt v24.10.6 (5fa11a1b) · hanwckf 110M 大分区布局
+
+            刷机用 factory.bin（uboot WebUI → showlayout 切到 immortalwrt-110m → 刷 factory.bin）。
+            刷完成后同一版本再次升级用 sysupgrade.bin。
+
+            - config.buildinfo：本次构建的实际配置，下次要复现就从它派生
+            - ax6000-110m-kmods.tar.gz：本次构建的全部 kmod
+              （vermagic 与官方一致时，内容与官方 kmods 池等价，可互相替代）
+          files: |
+            /builder/openwrt/bin/targets/mediatek/filogic/*.bin
+            /builder/openwrt/bin/targets/mediatek/filogic/*.manifest
+            /builder/openwrt/bin/targets/mediatek/filogic/*.json
+            /builder/openwrt/bin/targets/mediatek/filogic/config.buildinfo
+            /builder/ax6000-110m-kmods.tar.gz
