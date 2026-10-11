@@ -23,6 +23,7 @@
 | 触发方式 | 仅 `workflow_dispatch`（手动，带 `abi_strict` 开关） + `repository_dispatch`，**无定时任务** |
 | 产物 | `factory.bin` + `sysupgrade.bin` + manifest + profiles.json + **`config.buildinfo`** + **整包 kmods** |
 | Release 名 | `RedmiAX6000_110m_v24.10.6_<编译日期>` |
+| 步骤 | 17 个；后半段顺序固定为 **下载源码包 → 编译工具链 → ABI 门（只编内核核对 vermagic）→ 编译固件**，这三步都带 `V=s` 并把完整日志 `tee` 留存（artifact 里的 `toolchain.log` / `abi-gate.log` / `build.log`） |
 
 > 旧文件名里的 `compact` 是沿用上游命名，**已彻底弃用**：压缩方案（手写 fragment）会关掉 `CONFIG_ALL_KMODS`，
 > 使内核 ABI 哈希与官方分家，官方 kmods 装上去就是 `net_generic()` 空指针 panic。详见「与上游的差异」。
@@ -47,7 +48,7 @@
 
 ### 编译内容
 
-- **无线驱动**：ImmortalWrt 官方源码自带的**开源 `mt76`**（非闭源 `mt_wifi`），与 AX3000T 那套闭源驱动方案无关
+- **无线驱动**：ImmortalWrt 官方源码自带的**开源 `mt76`**（非闭源 `mt_wifi`）—— 与 AX3000T 现在跑的那份**同源同驱动**（它第 4 次刷机换的就是这个）
 - **主题**：`luci-theme-argon` + `luci-app-argon-config`（并把 luci 集合的默认主题从 bootstrap 换成 argon）
 - **代理支持（内核层）**：`kmod-tun`、`kmod-inet-diag`、`kmod-nft-tproxy`、`kmod-veth`、`kmod-nfnetlink-queue`、`kmod-nft-queue`
   （`kmod-sched-core`／`kmod-sched-bpf`／`kmod-xdp-sockets-diag` 官方镜像本来就带，配置里保持原样）
@@ -75,7 +76,7 @@
 
 > **为什么 2.4G 和 5G 的加密参数不一样？**
 > 2.4G 用 `psk2`（算法自动协商）是为了兼容只有 TKIP 的老设备和 IoT 家电；5G 用 `psk2+ccmp` 把算法钉死在 AES，因为**跨设备漫游只发生在 5G 频段**，算法固定能少一类兼容性变量。
-> 两台 AP 都不上 WPA3/SAE —— AX3000T 是闭源 `mt_wifi` 驱动，SAE 支持与跨驱动漫游都不可靠。
+> 两台都不上 WPA3/SAE —— 两台现在都是开源 `mt76`，SAE 本身支持，关掉它是为了老设备与 IoT 家电的兼容性，并让两台 AP 用同一套加密参数、漫游时少一类变量。
 
 ### 刻意没有做的事
 
@@ -136,12 +137,13 @@
 
 完整的从零流程（含 Actions 权限设置、uboot 分区切换、刷后验证）见 **[操作步骤-ax6000.md](操作步骤-ax6000.md)**。
 
-四条最容易出错的：
+五条最容易出错的：
 
 1. 仓库根目录必须有 `ax6000_110m_24.10.6.config` 和 `customize_immortalwrt_24.10.6.sh` 两个文件（工作流会显式检查，缺了直接报错退出；**文件名必须与 `env.CONFIG_FILE` / `env.CUSTOMIZE_SCRIPT` 一致**）
 2. Fork 的 Actions 需要先在 Actions 页面点横幅「I understand my workflows, go ahead and enable them」启用
 3. `Settings → Actions → General → Workflow permissions` 必须选 **Read and write**，否则创建 Release 会 403
-4. 跑完先看 `ABI 门` 那一步：出现 ✅ 才说明内核配置与官方一致、官方 kmods 池可用；出现 ⚠️ 就去 artifact 里的 `kernel-config-lines.txt` 排查
+4. 跑完先看 `ABI 门 — 只编内核，核对 vermagic` 那一步：出现 ✅ 才说明内核配置与官方一致、官方 kmods 池可用；出现 ⚠️ 就去 artifact 里的 `kernel-config-lines.txt` 排查
+5. 步骤顺序是 **下载源码包 → 编译工具链 → ABI 门 → 编译固件**，关键三步都带 `V=s` 并把完整日志 `tee` 到 `/builder/*.log`（同时上传 artifact）。2026-10-12 第一次跑之所以只看到一行 `ERROR: target/linux failed to build.`，是因为非 verbose 模式下 OpenWrt 把子 make 的输出整体重定向进 `/dev/null`，真正的报错没进日志；`V=s` 就是关掉这个重定向的开关
 
 ---
 
@@ -168,7 +170,7 @@
 | 设备 | 地址 | 角色 |
 | --- | --- | --- |
 | 红米 AX6000 | `192.168.0.2` | 主路由（PPPoE + DHCP，地址池 `.100`–`.249`） |
-| 小米 AX3000T | 固件默认 `192.168.6.1`，作 AP 后改为 `192.168.0.99` | 纯 AP（LAN↔LAN 有线连接，自身 DHCP 关闭） |
+| 小米 AX3000T | `192.168.0.99`（官方 24.10 首次开机默认 `192.168.1.1`，已改） | 纯 AP（LAN↔LAN 有线连接，自身 DHCP 关闭；开源 `mt76`） |
 
 > 光猫桥接后，**从 LAN 侧访问不到光猫的管理页 `192.168.1.1` 是正常现象**（客户端会对同网段地址直接发 ARP，报文不会上送到路由器）。需要进光猫时，直连光猫自己的 Wi-Fi 即可。
 
