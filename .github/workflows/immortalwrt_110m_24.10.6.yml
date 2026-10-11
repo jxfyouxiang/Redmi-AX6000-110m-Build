@@ -249,14 +249,66 @@ jobs:
           grep -cE '^CONFIG_PACKAGE_kmod-.*=y$' .config
           echo "✅ .config 生成完毕"
 
-      - name: ABI 门 — 先只编内核，核对 vermagic
+      - name: 下载所有源码包
         working-directory: /builder/openwrt
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          make download -j8 || make download -j1 V=s || true
+          echo "== 小于 1KB 的（= 下载失败）文件，列出来再删掉 =="
+          find dl -size -1024c -exec ls -l {} \; | tee /builder/dl-broken.txt
+          find dl -size -1024c -delete
+          echo "== dl 目录大小 =="
+          du -sh dl
+
+      # 为什么要专门编工具链：
+      # include/toplevel.mk 里所有内核相关操作都显式依赖 `toolchain/install`
+      # （prepare_kernel_conf: .config toolchain/install），而通用 `%::` 规则只跑 `prereq`，
+      # 不会替你把交叉编译器装好；内核编译需要 $TARGET_CROSS 里的 gcc。
+      # 缺它时，错误发生在被 include/verbose.mk 静音的子 make 里 —— 日志上只剩
+      # "ERROR: target/linux failed to build."，看不到真正原因。
+      # 这一步的产物在后面的正式编译里会被复用，不是额外开销。
+      - name: 编译工具链（ABI 门与正式编译共用）
+        working-directory: /builder/openwrt
+        run: |
+          set +e
+          echo "$(nproc) 线程编译工具链；完整日志 → /builder/toolchain.log，控制台只显示进度与错误"
+          make -j$(nproc) V=s tools/install toolchain/install 2>&1 | tee /builder/toolchain.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "工具链 make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found|Cannot' /builder/toolchain.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 120 行"
+            tail -n 120 /builder/toolchain.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+
+      - name: ABI 门 — 只编内核，核对 vermagic
+        working-directory: /builder/openwrt
+        run: |
+          set +e
           grep '^CONFIG_KERNEL_' .config | LC_ALL=C sort | tee /builder/kernel-config-lines.txt | head -n 40
+          # V=s 是必须的：include/verbose.mk 在非 verbose 下把子 make 的 stdout/stderr 整体
+          # 重定向到 /dev/null（SILENT:=>/dev/null 2>&1），只放行 MESSAGE 那几条
+          # " make[N] -C dir target" 进度行 ⇒ 失败时真正的原因会被吞掉。
           # 触发 Kernel/Configure ⇒ 写出 .vermagic（哈希的三条输入全在这里汇聚）
-          make -j$(nproc) target/linux/compile
-          VFILE=$(find build_dir -maxdepth 6 -name .vermagic | head -n1)
+          make -j$(nproc) V=s target/linux/compile 2>&1 | tee /builder/abi-gate.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "内核 make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found|Cannot|unrecognized' /builder/abi-gate.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 200 行"
+            tail -n 200 /builder/abi-gate.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+          VFILE=$(find build_dir -maxdepth 6 -name .vermagic -path '*mediatek*' | head -n1)
           [ -n "$VFILE" ] || { echo "::error::没有找到 .vermagic"; exit 1; }
           V=$(cat "$VFILE")
           echo ".vermagic 文件 : $VFILE"
@@ -273,28 +325,36 @@ jobs:
             fi
           fi
 
-      - name: 下载所有源码包
-        working-directory: /builder/openwrt
-        run: |
-          set -uo pipefail
-          make download -j8 || make download -j1 V=s || true
-          echo "== 小于 1KB 的（= 下载失败）文件，列出来再删掉 =="
-          find dl -size -1024c -exec ls -l {} \; | tee /builder/dl-broken.txt
-          find dl -size -1024c -delete
-          echo "== dl 目录大小 =="
-          du -sh dl
-
       - name: 编译固件
         working-directory: /builder/openwrt
         run: |
-          set -o pipefail
-          echo "$(nproc) 线程编译"
-          make -j$(nproc) 2>&1 | tee /builder/build.log
+          set +e
+          echo "$(nproc) 线程编译；完整日志 → /builder/build.log，控制台只显示进度与错误"
+          make -j$(nproc) V=s 2>&1 | tee /builder/build.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|undefined reference|unrecognized|not found|Cannot install' /builder/build.log | tail -n 80 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 200 行"
+            tail -n 200 /builder/build.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
 
-      - name: 编译失败时打印日志尾部
+      - name: 编译失败时打印各段日志的错误行
         if: failure()
         run: |
-          tail -n 200 /builder/build.log || true
+          for f in /builder/abi-gate.log /builder/toolchain.log /builder/build.log; do
+            if [ -s "$f" ]; then
+              echo "::group::$f"
+              grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found' "$f" | tail -n 40 || true
+              tail -n 40 "$f" || true
+              echo "::endgroup::"
+            fi
+          done
 
       - name: 汇总产物（含 kmods 池与 config.buildinfo）
         if: always()
@@ -319,6 +379,8 @@ jobs:
           cat "$TDIR"/*.vermagic 2>/dev/null || true
           echo "== bin 目录大小 =="
           du -sh bin
+          echo "== 各段日志体积 =="
+          ls -lh /builder/*.log 2>/dev/null || true
 
       - name: 上传 artifact
         if: always()
@@ -332,6 +394,8 @@ jobs:
             /builder/openwrt/bin/targets/mediatek/filogic/*.json
             /builder/openwrt/bin/targets/mediatek/filogic/config.buildinfo
             /builder/ax6000-110m-kmods.tar.gz
+            /builder/abi-gate.log
+            /builder/toolchain.log
             /builder/build.log
             /builder/dl-broken.txt
             /builder/kernel-config-lines.txt
