@@ -16,27 +16,30 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 文件 | `.github/workflows/immortalwrt_110m_compact_24.10.yml` |
-| 显示名称 | `immortalwrt_110m_compact_24.10` |
-| 源码 | [immortalwrt/immortalwrt](https://github.com/immortalwrt/immortalwrt) `openwrt-24.10` 分支 |
-| 配置文件 | `ax6000_110m.config` |
-| 触发方式 | 仅 `workflow_dispatch`（手动） + `repository_dispatch`，**已无定时任务** |
-| 产物 | `factory.bin` + `sysupgrade.bin` + manifest + profiles.json |
-| Release 名 | `RedmiAX6000_110m_24.10_<编译日期>` |
+| 文件 | `.github/workflows/immortalwrt_110m_24.10.6.yml` |
+| 显示名称 | `immortalwrt_110m_24.10.6` |
+| 源码 | [immortalwrt/immortalwrt](https://github.com/immortalwrt/immortalwrt) **tag `v24.10.6`**（commit `5fa11a1b…`，内核 6.6.133） |
+| 配置文件 | `ax6000_110m_24.10.6.config`（由官方 `config.buildinfo` 派生，不是手写 fragment） |
+| 触发方式 | 仅 `workflow_dispatch`（手动，带 `abi_strict` 开关） + `repository_dispatch`，**无定时任务** |
+| 产物 | `factory.bin` + `sysupgrade.bin` + manifest + profiles.json + **`config.buildinfo`** + **整包 kmods** |
+| Release 名 | `RedmiAX6000_110m_v24.10.6_<编译日期>` |
 
-> workflow 文件名里的 `compact` 是沿用上游命名，**本仓库实际已放弃压缩方案**，见下文「与上游的差异」。
+> 旧文件名里的 `compact` 是沿用上游命名，**已彻底弃用**：压缩方案（手写 fragment）会关掉 `CONFIG_ALL_KMODS`，
+> 使内核 ABI 哈希与官方分家，官方 kmods 装上去就是 `net_generic()` 空指针 panic。详见「与上游的差异」。
 
 ### 与上游的差异
 
 | 项目 | 上游 | 本仓库 |
 | --- | --- | --- |
-| 使用的配置 | `ax6000_immortalwrt_110m_compact.config`（压缩优先，砍功能换空间） | `ax6000_110m.config`（官方默认包 + Argon + 代理内核层，不压缩） |
+| 使用的配置 | `ax6000_immortalwrt_110m_compact.config`（压缩优先，砍功能换空间） | `ax6000_110m_24.10.6.config`（**从官方 `config.buildinfo` 派生**；官方默认包 + Argon + 代理内核层，不压缩） |
+| 源码版本 | `openwrt-24.10` 分支（浮动，每次编可能不是同一份代码） | **tag `v24.10.6`**（冻结；`feeds.conf.default` 里 4 个 feed 也已用 `^commit` 钉死） |
+| 内核 ABI | 手写 fragment ⇒ 哈希与官方不同 ⇒ 官方 kmods 全废 | **与官方一致**（`a8b93917…`）⇒ 官方 1067 个 kmod 可直接 `opkg install` |
 | 管理地址 | `192.168.16.1` | **`192.168.0.2`** |
-| 主机名 | `ImmortalWrt` | **`AX6000`** |
+| 主机名 | `ImmortalWrt` | **`Redmi_805D`** |
 | 默认主题 | `bootstrap` | **`Argon`** |
 | 2.4G SSID | `Redmi-2.4G` | **`Redmi_805D`** |
 | 5G SSID | `Redmi-5G` | **`Redmi_805D_5G`** |
-| Wi-Fi 密码 | `qwer1234` | **12345678** |
+| Wi-Fi 密码 | `qwer1234` | **`u2hdehyh`** |
 
 ---
 
@@ -45,24 +48,27 @@
 ### 编译内容
 
 - **无线驱动**：ImmortalWrt 官方源码自带的**开源 `mt76`**（非闭源 `mt_wifi`），与 AX3000T 那套闭源驱动方案无关
-- **主题**：`luci-theme-argon` + `luci-app-argon-config`
-- **代理支持（内核层）**：`kmod-tun`、`kmod-inet-diag`、`kmod-nft-tproxy`、`kmod-veth`、`kmod-sched-core`、`kmod-sched-ingress`、`kmod-sched-bpf`、`kmod-xdp-sockets-diag`
-- **daed 所需的 BPF / BTF 内核选项**：`CONFIG_KERNEL_BPF*`、`DEBUG_INFO_BTF`、`XDP_SOCKETS`、`KPROBE_EVENTS` 等一整套
+- **主题**：`luci-theme-argon` + `luci-app-argon-config`（并把 luci 集合的默认主题从 bootstrap 换成 argon）
+- **代理支持（内核层）**：`kmod-tun`、`kmod-inet-diag`、`kmod-nft-tproxy`、`kmod-veth`、`kmod-nfnetlink-queue`、`kmod-nft-queue`
+  （`kmod-sched-core`／`kmod-sched-bpf`／`kmod-xdp-sockets-diag` 官方镜像本来就带，配置里保持原样）
+- **内核选项**：**一行 `CONFIG_KERNEL_*` 都不写**，全部原样继承官方 `config.buildinfo`（包括 `MODULE_ALLOW_BTF_MISMATCH=y`）。
+  手写那 15 行 `CONFIG_KERNEL_BPF*` 本身和官方取值相同（**不是**上次 panic 的原因），但"手写包清单"这种做法会连带关掉 `CONFIG_ALL_KMODS`，那才会让内核 ABI 哈希分家
 - **用户态依赖**：`bash`、`dnsmasq-full`、`ip-full`、`unzip`、`ca-bundle`、`luci-compat`
 
-**注意**：这里只编进「内核层的东西」。`luci-app-openclash`、`luci-app-daed` 的**本体不预装**，刷完后自行 `opkg install` 即可 —— 内核模块与内核版本绑定、自编译固件没有配套 kmod 源，所以它们必须编译时决定；而插件本体是纯用户态文件，随时能装。
+**注意**：装进固件的只是「内核层的东西」。`luci-app-openclash`、`luci-app-daed` 的**本体不预装**，刷完后自行 `opkg install` 即可。
+本版固件的 vermagic 与官方 24.10.6 完全相同（`a8b93917f464536104594f27d870028d`），所以官方 kmods 池（1067 个包）可以直接装，**不需要** `--force-depends`。
 
 ### 默认参数
 
 | 项目 | 配置 |
 | --- | --- |
 | 管理地址 | `192.168.0.2` |
-| 主机名 | `AX6000` |
+| 主机名 | `Redmi_805D` |
 | 用户名 | `root` |
-| 默认密码 |  **首次登录必须设置**（固件出厂不带密码） |
+| 默认密码 | 无 |
 | 2.4G Wi-Fi | `Redmi_805D`，WPA2-PSK，加密算法**自动协商**（`psk2`） |
 | 5G Wi-Fi | `Redmi_805D_5G`，WPA2-PSK，**强制 AES/CCMP**（`psk2+ccmp`） |
-| Wi-Fi 密码 | 12345678 |
+| Wi-Fi 密码 | `u2hdehyh` |
 | 国家 / 区域 | `CN` |
 
 首次登录后请立即设置管理密码，并建议修改 Wi-Fi 密码。
@@ -73,7 +79,7 @@
 
 ### 刻意没有做的事
 
-这是一份 **fragment config**，只写「与官方默认不同」的部分，`make defconfig` 会自动补齐其余官方默认包。以下几项是**有意保持默认**的：
+这份配置**不是**手写的 fragment，而是从官方 24.10.6 的 `config.buildinfo` 逐字派生，只做了 3 处 delta：①只勾 110M 这一台设备（关掉 `TARGET_ALL_PROFILES`）；②加 11 个要装进固件的包；③其余 287 行原样照抄 —— 包括 `CONFIG_ALL_KMODS=y`、`CONFIG_ALL_NONSHARED=y`、`CONFIG_TARGET_PER_DEVICE_ROOTFS=y` 和 16 条 `CONFIG_KERNEL_*`。这几条决定了内核 ABI 哈希，动了它们官方 kmods 就废了。以下几项是**有意保持默认**的：
 
 | 选项 | 为什么不开 |
 | --- | --- |
@@ -84,9 +90,9 @@
 
 ### 空间预期
 
-- `factory.bin` / `sysupgrade.bin` 约 **16 MB**（上游压缩版也是这个量级，所以压缩在这里并没有换到额外收益）
-- 刷入后 overlay 预计 **约 80 MB**（以刷完后 `df -h /overlay` 为准）
-- 参考：非压缩但预装 OpenClash + Passwall 本体的固件约 45 MB，overlay 只剩 ~55 MB
+- 固件大小以本次 Release 为准；110 MiB 的分区足够大，没必要再为了省几 MB 去砍功能 —— 砍功能换来的那点空间，代价是内核 ABI 与官方分家
+- 刷入后 overlay 预计 **70~85 MB**（以刷完后 `df -h /overlay` 为准）
+- 参考：预装 OpenClash + Passwall 本体的固件约 45 MB，overlay 只剩 ~55 MB
 
 ---
 
@@ -97,14 +103,14 @@
 ├── .github/
 │   ├── dependabot.yml
 │   └── workflows/
-│       └── immortalwrt_110m_compact_24.10.yml   ← 唯一启用
+│       └── immortalwrt_110m_24.10.6.yml           ← 唯一启用
 ├── Backups/                                      ← 已停用的上游 workflow
 │   ├── immortalwrt_110m.yml
 │   ├── immortalwrt_110m_compact_25.12.yml
 │   ├── immortalwrt_237_110m.yml
 │   └── LEDE_110m.yml
-├── ax6000_110m.config                            ← 本仓库使用的配置
-├── customize_immortalwrt.sh                      ← 本仓库使用的定制脚本
+├── ax6000_110m_24.10.6.config                    ← 本仓库使用的配置（文件名带版本）
+├── customize_immortalwrt_24.10.6.sh              ← 本仓库使用的定制脚本（文件名带版本）
 ├── ax6000_immortalwrt_110m.config                ← 上游配置，保留备查
 ├── ax6000_immortalwrt_110m_compact.config        ← 上游配置，保留备查
 ├── ax6000_LEDE_110m.config                       ← 上游配置，保留备查
@@ -113,14 +119,16 @@
 └── README.md
 ```
 
-`customize_immortalwrt.sh` 做了四件事：
+**命名约定**：配置、定制脚本、workflow 三份文件的名字里都带 ImmortalWrt 版本号（`immortalwrt_110m_24.10.6.yml` / `ax6000_110m_24.10.6.config` / `customize_immortalwrt_24.10.6.sh`）。这样做是为了以后能并存：哪天真要试 25.12，新的一套三个文件直接摆进来，不会覆盖 24.10.6 这套 —— 上一版全部叫无版本名的 `ax6000_110m.config` / `customize_immortalwrt.sh`，换个版本就只能原地覆盖，历史配置无处可查。**工作流里通过 `env.CONFIG_FILE` / `env.CUSTOMIZE_SCRIPT` 引用这两个名字，改文件名必须同时改这两行。**
 
-1. 改默认 LAN IP：`192.168.1.1` → `192.168.0.2`
-2. 改默认主机名：`ImmortalWrt` → `AX6000`
-3. 把 luci 集合的默认主题 `luci-theme-bootstrap` 换成 `luci-theme-argon`
-4. 写入 `/etc/uci-defaults/99-set-default-wifi`，首次开机自动开好两个频段的 SSID / 加密 / 密码
+`customize_immortalwrt_24.10.6.sh` 做了四件事（`set -euo pipefail`，每件都先断言目标串存在，对不上就中止编译，不再静默 no-op）：
 
-> `uci-defaults` 脚本只在**首次开机**执行一次，执行成功（`exit 0`）后文件会自动删除；执行 `firstboot` 或 `sysupgrade -n` 擦除配置后，下次开机会重新执行一遍。
+1. 改默认 LAN IP：`192.168.1.1` → `192.168.0.2`，并回验
+2. 改默认主机名：`ImmortalWrt` → `Redmi_805D`（只替换 `hostname='…'` 那一行，不再整文件 `s///g`）
+3. 把 luci 集合的默认主题 `luci-theme-bootstrap` 换成 `luci-theme-argon`（找不到时打 `::warning::`，由 config 的包选择兜底）
+4. 安装 `/etc/uci-defaults/99-set-default-wifi`，开机自动开好两个频段的 SSID / 加密 / 密码 —— **但加了守卫**：`default_radio0` 已有密码就直接 `exit 0`，所以以后的 `sysupgrade` 不会再把手改过的 WiFi 设置打回默认值
+
+> `uci-defaults` 脚本在**首次开机**执行一次，成功（`exit 0`）后文件自动删除；执行 `firstboot` 或 `sysupgrade -n` 擦除配置后会再执行一遍 —— 上面那个守卫就是为这种情况准备的。**但 hostname（第 2 条）和 LAN IP 是改在源码默认值里的，不受守卫保护**，也正因为如此才不会再被 uci-defaults 覆盖。
 
 ---
 
@@ -128,11 +136,12 @@
 
 完整的从零流程（含 Actions 权限设置、uboot 分区切换、刷后验证）见 **[操作步骤-ax6000.md](操作步骤-ax6000.md)**。
 
-三条最容易出错的：
+四条最容易出错的：
 
-1. 仓库里改 workflow 的 `CONFIG_FILE:` 时，必须写成 `'ax6000_110m.config'`（忘了改就还是编压缩方案）
+1. 仓库根目录必须有 `ax6000_110m_24.10.6.config` 和 `customize_immortalwrt_24.10.6.sh` 两个文件（工作流会显式检查，缺了直接报错退出；**文件名必须与 `env.CONFIG_FILE` / `env.CUSTOMIZE_SCRIPT` 一致**）
 2. Fork 的 Actions 需要先在 Actions 页面点横幅「I understand my workflows, go ahead and enable them」启用
 3. `Settings → Actions → General → Workflow permissions` 必须选 **Read and write**，否则创建 Release 会 403
+4. 跑完先看 `ABI 门` 那一步：出现 ✅ 才说明内核配置与官方一致、官方 kmods 池可用；出现 ⚠️ 就去 artifact 里的 `kernel-config-lines.txt` 排查
 
 ---
 
