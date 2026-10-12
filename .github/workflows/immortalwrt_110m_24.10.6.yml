@@ -243,6 +243,22 @@ jobs:
           for p in kmod-nft-queue kmod-nfnetlink-queue luci-theme-argon; do
             grep -q "^CONFIG_PACKAGE_$p=y" .config || { echo "::error::$p 没被选中"; exit 1; }
           done
+
+          # perf：2026-10-12 第二次失败的直接原因（内核 6.6.133 的坏回溯补丁 —— tools/perf/util/unwind-libdw.c
+          # 调用了 map_symbol__exit()，而 map_symbol.c 在 6.6.133 里根本不存在，util/Build 里也没有 map_symbol.o）。
+          # 我们靠 config 里那行 `# CONFIG_PACKAGE_perf is not set` 把关掉它；这里验证那行真的生效 ——
+          # 因为 perf 带 PKG_FLAGS:=nonshared，理论上可能被 Kconfig 的 `default m if ALL_NONSHARED` 顶回来，
+          # 那样第三次跑还会在同一个地方倒（差别只是白等 3 小时）。
+          if grep -qE '^CONFIG_PACKAGE_perf=' .config; then
+            echo "::error::perf 仍被选中：$(grep -E '^CONFIG_PACKAGE_perf=' .config)"
+            echo "::error::说明 config 里那行 is not set 压不住 ALL_NONSHARED 的默认值，改走备选方案："
+            echo "::error::在『编译固件』之前 sed 给 package/devel/perf/Makefile 的 MAKE_FLAGS 加 NO_LIBDW=1（内核 perf 自己的开关，同样只影响这个包）"
+            exit 1
+          fi
+          grep -q '^# CONFIG_PACKAGE_perf is not set' .config \
+            || { echo "::error::config 里那行 # CONFIG_PACKAGE_perf is not set 不见了（被 defconfig 丢掉？）"; exit 1; }
+          echo "✅ perf 已关闭：不会编 package/devel/perf，6.6.133 那个坏回溯补丁碰不到"
+
           echo "== 内核相关行数 =="
           grep -c '^CONFIG_KERNEL_' .config
           echo "== 明确装进固件的 kmod 数 =="
@@ -311,6 +327,20 @@ jobs:
           VFILE=$(find build_dir -maxdepth 6 -name .vermagic -path '*mediatek*' | head -n1)
           [ -n "$VFILE" ] || { echo "::error::没有找到 .vermagic"; exit 1; }
           V=$(cat "$VFILE")
+          # 把这三行证据写成文件、随 artifact 上传：运行页面上的控制台输出会过期，
+          # artifact 可以离线反复核对（2026-10-12 那次失败就只能靠"跑过了门"反推）。
+          cp -v "$VFILE" /builder/dot-vermagic.txt
+          {
+            echo "==== ABI 门取证 ===="
+            echo "构建时间(北京时间) : $(TZ=Asia/Shanghai date -Is)"
+            echo "源码 tag / commit  : $REPO_BRANCH / $(git -C /builder/openwrt rev-parse HEAD)"
+            echo ".config sha256     : $(sha256sum .config | cut -d' ' -f1)"
+            echo ".vermagic 文件     : $VFILE"
+            echo "实际 vermagic      : $V"
+            echo "官方 vermagic      : $EXPECTED_VERMAGIC"
+            echo "期望内核版本       : $EXPECTED_KERNEL"
+            echo "结论               : $([ "$V" = "$EXPECTED_VERMAGIC" ] && echo 与官方一致 || echo 与官方不一致)"
+          } | tee /builder/vermagic.txt
           echo ".vermagic 文件 : $VFILE"
           echo "实际 vermagic  : $V"
           echo "官方 vermagic  : $EXPECTED_VERMAGIC  (内核 $EXPECTED_KERNEL)"
@@ -399,6 +429,8 @@ jobs:
             /builder/build.log
             /builder/dl-broken.txt
             /builder/kernel-config-lines.txt
+            /builder/vermagic.txt
+            /builder/dot-vermagic.txt
           if-no-files-found: warn
           retention-days: 14
 
