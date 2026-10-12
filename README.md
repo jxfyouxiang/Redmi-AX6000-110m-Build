@@ -23,7 +23,7 @@
 | 触发方式 | 仅 `workflow_dispatch`（手动，带 `abi_strict` 开关） + `repository_dispatch`，**无定时任务** |
 | 产物 | `factory.bin` + `sysupgrade.bin` + manifest + profiles.json + **`config.buildinfo`** + **整包 kmods** |
 | Release 名 | `RedmiAX6000_110m_v24.10.6_<编译日期>` |
-| 步骤 | 17 个；后半段顺序固定为 **下载源码包 → 编译工具链 → ABI 门（只编内核核对 vermagic）→ 编译固件**，这三步都带 `V=s` 并把完整日志 `tee` 留存（artifact 里的 `toolchain.log` / `abi-gate.log` / `build.log`） |
+| 步骤 | 17 个；后半段顺序固定为 **下载源码包 → 编译工具链 → ABI 门（只编内核核对 vermagic）→ 编译固件**，这三步都带 `V=s` 并把完整日志 `tee` 留存（artifact 里的 `toolchain.log` / `abi-gate.log` / `build.log`；ABI 门另把结论写成 `vermagic.txt`，并附上 `.vermagic` 原文件 `dot-vermagic.txt`） |
 
 > 旧文件名里的 `compact` 是沿用上游命名，**已彻底弃用**：压缩方案（手写 fragment）会关掉 `CONFIG_ALL_KMODS`，
 > 使内核 ABI 哈希与官方分家，官方 kmods 装上去就是 `net_generic()` 空指针 panic。详见「与上游的差异」。
@@ -143,7 +143,7 @@
 2. Fork 的 Actions 需要先在 Actions 页面点横幅「I understand my workflows, go ahead and enable them」启用
 3. `Settings → Actions → General → Workflow permissions` 必须选 **Read and write**，否则创建 Release 会 403
 4. 跑完先看 `ABI 门 — 只编内核，核对 vermagic` 那一步：出现 ✅ 才说明内核配置与官方一致、官方 kmods 池可用；出现 ⚠️ 就去 artifact 里的 `kernel-config-lines.txt` 排查
-5. 步骤顺序是 **下载源码包 → 编译工具链 → ABI 门 → 编译固件**，关键三步都带 `V=s` 并把完整日志 `tee` 到 `/builder/*.log`（同时上传 artifact）。2026-10-12 第一次跑之所以只看到一行 `ERROR: target/linux failed to build.`，是因为非 verbose 模式下 OpenWrt 把子 make 的输出整体重定向进 `/dev/null`，真正的报错没进日志；`V=s` 就是关掉这个重定向的开关
+5. 步骤顺序是 **下载源码包 → 编译工具链 → ABI 门 → 编译固件**，关键三步都带 `V=s` 并把完整日志 `tee` 到 `/builder/*.log`（同时上传 artifact）。2026-10-12 第一次跑之所以只看到一行 `ERROR: target/linux failed to build.`，是因为非 verbose 模式下 OpenWrt 把子 make 的输出整体重定向进 `/dev/null`，真正的报错没进日志；`V=s` 就是关掉这个重定向的开关。第二次跑（2 小时 59 分）则死在 `package/devel/perf` —— 那是内核 6.6.133 自己的坏回溯补丁（`map_symbol__exit` 未定义），与内核 / ABI 无关；处置是在 config 里 `# CONFIG_PACKAGE_perf is not set`（perf 是 m 包、不进固件，且没有任何 `Kernel-Config`，所以对 ABI 哈希零影响）
 
 ---
 
