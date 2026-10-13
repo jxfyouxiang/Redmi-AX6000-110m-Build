@@ -394,7 +394,25 @@ jobs:
         if: always()
         working-directory: /builder/openwrt
         run: |
-          set -euo pipefail
+          # 这一步是「收尸」：正式编译倒了也要把日志与已有产物收上来。
+          # 所以刻意不用 set -e —— 2026-10-13 第一次 25.12 编译失败时，bin/targets 不存在，
+          # find 直接以 1 退出，控制台只剩一句 find: 'bin/targets': No such file or directory，
+          # 真正的失败原因（更早的步骤）反而被它盖住了。
+          set -uo pipefail
+          if [ ! -d bin/targets ]; then
+            echo "::error::bin/targets 不存在 ⇒ 正式编译没有产出任何镜像，真正的失败在更早的步骤"
+            echo "::group::ABI 门 / 各段日志的关键行"
+            grep -nE 'ABI|vermagic|结论|一致|Error [0-9]+|error:|fatal|No space left|Killed|not found' /builder/abi-gate.log 2>/dev/null | tail -n 25 || true
+            echo "::endgroup::"
+            for f in /builder/abi-gate.log /builder/toolchain.log /builder/build.log; do
+              [ -s "$f" ] || continue
+              echo "::group::$f 尾部 40 行"
+              tail -n 40 "$f" || true
+              echo "::endgroup::"
+            done
+            echo "（上传 artifact 那一步会把完整日志一并交出：abi-gate.log / toolchain.log / build.log / vermagic.txt / dot-vermagic.txt / kernel-config-lines.txt）"
+            exit 0
+          fi
           TDIR=$(find bin/targets -maxdepth 2 -mindepth 2 -type d | head -n1)
           echo "target 目录: $TDIR"
           ls -lh "$TDIR" || true
