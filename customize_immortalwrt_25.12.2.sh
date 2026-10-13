@@ -30,7 +30,25 @@
 #=================================================
 set -euo pipefail
 
-OW="${OPENWRT_DIR:-$HOME/openwrt}"  # 本地版：云端是 OW=/builder/openwrt
+# OW 解析（云端与本机都要能用 —— 2026-10-13 第一次 25.12 云编译就栽在这里）：
+#   ① OPENWRT_DIR 环境变量（本地套件 config.env 里 export 的就是它）
+#   ② 当前目录 —— 云端工作流这一步的 working-directory 就是 /builder/openwrt
+#   ③ 常见位置兜底（/builder/openwrt、$HOME/openwrt25、$HOME/openwrt）
+# 旧写法是 OW="${OPENWRT_DIR:-$HOME/openwrt}"：云端 runner 的 $HOME 是 /home/runner，
+# 于是脚本跑去找 /home/runner/openwrt/package/… ⇒ 报 "config_generate 不存在" 而中止。
+# （24.10.6 那份脚本写死 OW=/builder/openwrt，所以这个坑一直没暴露。）
+pick_ow() {
+  local c
+  if [ -n "${OPENWRT_DIR:-}" ] && [ -f "$OPENWRT_DIR/package/base-files/files/bin/config_generate" ]; then
+    printf '%s' "$OPENWRT_DIR"; return 0
+  fi
+  for c in "$PWD" /builder/openwrt "$HOME/openwrt25" "$HOME/openwrt"; do
+    if [ -f "$c/package/base-files/files/bin/config_generate" ]; then printf '%s' "$c"; return 0; fi
+  done
+  printf '%s' "${OPENWRT_DIR:-$PWD}"   # 都找不到：交给下面那条断言报错，别在这里猜
+}
+OW="$(pick_ow)"
+echo "源码树 OW = $OW"
 CG=$OW/package/base-files/files/bin/config_generate
 
 # ---------- 0. 前置断言：sed 目标必须真的存在 ----------
