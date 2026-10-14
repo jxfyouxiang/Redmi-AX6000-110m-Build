@@ -192,10 +192,48 @@ jobs:
           };
           EOF
 
-          # 3. 结果确认
+          # 3. 上游 25.12 缺陷兜底：netgear FIT 的 rootfs 节点（不加这段，编译必挂在 target/linux/install）
+          #    filogic.mk:13 会拼出 $(KERNEL_BUILD_DIR)/root.squashfs+pkg=$(ROOTFS_ID/$(DEVICE_NAME))，
+          #    而 ROOTFS_ID 只为「被选中的设备」生成（include/image.mk:610）——
+          #    没勾选的 netgear 设备于是拿到一个不存在的 .../root.squashfs+pkg= ，
+          #    脚本 stat/sha1sum 失败 → FIT 里出现 "value = ;" →
+          #    mkimage 报 netgear_eax17-kernel.bin.its:50.12-13 syntax error → 整个 make world 挂掉。
+          #    （官方 release 用 TARGET_ALL_PROFILES=y 编译，所有设备都被选中，所以上游碰不到。）
+          #    兜底：文件不存在就换成一个空文件，让上游自己的代码继续跑，输出格式分毫不变。
+          NGFIT=scripts/gen_netgear_rootfs_node.sh
+          if [ ! -f "$NGFIT" ]; then
+            echo "⏭  上游没有 $NGFIT，无需兜底"
+          elif grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT"; then
+            echo "⏭  已打过 netgear 空 rootfs 兜底补丁，跳过"
+          else
+            GUARD=$(mktemp)
+            cat > "$GUARD" <<'GUARD_EOF'
+          # AX6000-KIT: netgear-empty-rootfs-guard
+          if [ ! -f "$ROOTFS_FILE" ]; then
+          	ROOTFS_FILE=$(mktemp)
+          fi
+          GUARD_EOF
+            awk -v guard="$GUARD" '
+              /^ROOTFS_FILE="\$1"$/ && !done {
+                print
+                while ((getline line < guard) > 0) print line
+                close(guard); done = 1; next
+              }
+              { print }
+            ' "$NGFIT" > "$NGFIT.kitnew" && mv "$NGFIT.kitnew" "$NGFIT"
+            rm -f "$GUARD"
+            grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT" || {
+              echo "::error::$NGFIT 里的 ROOTFS_FILE=\"\$1\" 那一行被上游改过，兜底没打上，请人工核对"
+              exit 1
+            }
+            echo "✅ 已给 $NGFIT 加空 rootfs 兜底（上游窄配置缺陷）"
+          fi
+
+          # 4. 结果确认
           grep -q 'Device/xiaomi_redmi-router-ax6000-110m' target/linux/mediatek/image/filogic.mk
           test -f target/linux/mediatek/dts/mt7986a-xiaomi-redmi-router-ax6000-110m.dts
           grep -n 'xiaomi_redmi-router-ax6000-110m' target/linux/mediatek/image/filogic.mk
+          grep -n 'AX6000-KIT: netgear-empty-rootfs-guard' -A 3 scripts/gen_netgear_rootfs_node.sh
           echo "✅ AX6000 110M 大分区适配代码补丁应用成功！"
 
       - name: 更新并安装 feeds
