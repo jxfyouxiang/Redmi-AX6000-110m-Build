@@ -203,30 +203,45 @@ jobs:
           NGFIT=scripts/gen_netgear_rootfs_node.sh
           if [ ! -f "$NGFIT" ]; then
             echo "⏭  上游没有 $NGFIT，无需兜底"
-          elif grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT"; then
-            echo "⏭  已打过 netgear 空 rootfs 兜底补丁，跳过"
           else
-            GUARD=$(mktemp)
-            cat > "$GUARD" <<'GUARD_EOF'
+            if grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT"; then
+              echo "⏭  已打过 netgear 空 rootfs 兜底补丁，跳过"
+            else
+              GUARD=$(mktemp)
+              cat > "$GUARD" <<'GUARD_EOF'
           # AX6000-KIT: netgear-empty-rootfs-guard
           if [ ! -f "$ROOTFS_FILE" ]; then
           	ROOTFS_FILE=$(mktemp)
           fi
           GUARD_EOF
-            awk -v guard="$GUARD" '
-              /^ROOTFS_FILE="\$1"$/ && !done {
-                print
-                while ((getline line < guard) > 0) print line
-                close(guard); done = 1; next
+              awk -v guard="$GUARD" '
+                /^ROOTFS_FILE="\$1"$/ && !done {
+                  print
+                  while ((getline line < guard) > 0) print line
+                  close(guard); done = 1; next
+                }
+                { print }
+              ' "$NGFIT" > "$NGFIT.kitnew"
+              # ⚠️ 必须「原地截断写回」，不能用 mv：mv 会把新文件（umask 644）的权限盖到上游脚本上，
+              #    而 filogic.mk 是直接执行这个脚本的 ⇒ 镜像阶段报
+              #      bash: .../scripts/gen_netgear_rootfs_node.sh: Permission denied
+              #      make[5]: *** [.../netgear_eax17-kernel.bin] Error 126
+              #    （2026-10-14 本地实跑踩到；云端第二轮也是同一个洞，只是还没跑到镜像阶段。）
+              cat "$NGFIT.kitnew" > "$NGFIT"
+              rm -f "$NGFIT.kitnew"
+              chmod 755 "$NGFIT"
+              rm -f "$GUARD"
+              grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT" || {
+                echo "::error::$NGFIT 里的 ROOTFS_FILE=\"\$1\" 那一行被上游改过，兜底没打上，请人工核对"
+                exit 1
               }
-              { print }
-            ' "$NGFIT" > "$NGFIT.kitnew" && mv "$NGFIT.kitnew" "$NGFIT"
-            rm -f "$GUARD"
-            grep -q 'AX6000-KIT: netgear-empty-rootfs-guard' "$NGFIT" || {
-              echo "::error::$NGFIT 里的 ROOTFS_FILE=\"\$1\" 那一行被上游改过，兜底没打上，请人工核对"
-              exit 1
-            }
-            echo "✅ 已给 $NGFIT 加空 rootfs 兜底（上游窄配置缺陷）"
+              echo "✅ 已给 $NGFIT 加空 rootfs 兜底（上游窄配置缺陷；权限已确保 755）"
+            fi
+            # 幂等分支之外再复查一次可执行位（旧版用 mv 写回的补丁曾把 755 冲成 644）
+            if [ ! -x "$NGFIT" ]; then
+              chmod 755 "$NGFIT"
+              echo "🔧 修复 $NGFIT 的可执行位（644 → 755）"
+            fi
           fi
 
           # 4. 结果确认
@@ -313,10 +328,12 @@ jobs:
           set -uo pipefail
           make download -j8 || make download -j1 V=s || true
           echo "== 小于 1KB 的（= 下载失败）文件，列出来再删掉 =="
-          find dl -size -1024c -exec ls -l {} \; | tee /builder/dl-broken.txt
-          find dl -size -1024c -delete
+          # dl 可能是软链（复用缓存）⇒ find 必须 -L 跟随；否则它会把「软链本身」当成
+          # 28 字节的失败文件，下面那行的 -delete 就会把软链删掉（2026-10-14 本机踩过）。
+          find -L dl -maxdepth 1 -type f -size -1024c -exec ls -l {} + 2>/dev/null | tee /builder/dl-broken.txt || true
+          find -L dl -maxdepth 1 -type f -size -1024c -delete 2>/dev/null || true
           echo "== dl 目录大小 =="
-          du -sh dl
+          du -sh dl 2>/dev/null || true
 
       # 为什么要专门编工具链：
       # include/toplevel.mk 里所有内核相关操作都显式依赖 `toolchain/install`
