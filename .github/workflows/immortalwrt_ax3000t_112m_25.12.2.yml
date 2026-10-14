@@ -1,0 +1,541 @@
+# =============================================================================
+# 小米 AX3000T (Mi Router AX3000T) · ImmortalWrt v25.12.2 · yuzhii/hanwckf MTK U-Boot 112M 大分区
+#
+# 设备背景（为什么是这套布局）：
+#   这台机器已经刷了 yuzhii / hanwckf 的 MTK U-Boot，并用它的 WebUI 刷过
+#   `immortalwrt-112m` 布局的 24.10 固件（ubl 分区 0x600000 + 0x7000000 = 112 MiB）。
+#   该 U-Boot 的启动方式固定：挂载 UBI → 读名为 kernel 的卷 → bootm。
+#   ⇒ 所以镜像必须 KERNEL_IN_UBI=1 + factory.bin := append-ubi（整份 UBI 镜像），
+#     不能用上游 ubootmod 那种 .itb / FIT 方案（那是给 OpenWrt 自己的 U-Boot 用的）。
+#   ⇒ 机型名沿用 24.10 那版的 xiaomi_mi-router-ax3000t-mtkuboot，
+#     这样 board_name 与现在跑的固件一致 ⇒ 以后可以用 LuCI 就地升级、配置保留。
+#
+# 这份工作流相对 AX6000 那份（immortalwrt_110m_25.12.2.yml）的关系：
+#   同一台 target（mediatek/filogic）、同一个内核 6.12.103 ⇒ ABI 哈希完全相同，
+#   官方 kmods 池（1120 个 apk）两份固件通用；差别只在设备定义/DTS/IMAGE_SIZE。
+#
+# 这份工作流相对旧版（ax3000t-mt76 的 24.10 版）改了什么、以及为什么必须改：
+#
+#  A. 源码钉死在 v25.12.2（peeled commit 4fc16f29…；annotated tag 对象 bfc8bae0…）
+#     旧版 clone openwrt-24.10 分支 ⇒ 每次编译拿到的内核版本 / 内核配置 /
+#     kmod 包的 KCONFIG 都可能不同 ⇒ 内核 ABI 哈希（vermagic）漂移。
+#     为什么这很致命：包管理器的依赖是 kernel (=6.12.103~b5b7729f…-r1)（25.12 起是 apk），
+#     固件里自己编的 .ko 与官方 kmods 池必须"内核版本 + 哈希"双双相等才能混用。
+#     钉 tag 的额外好处：v25.12.2 的 feeds.conf.default 里 5 个 feed 全都自带
+#     ^commit 钉死（packages^84bd8638 / luci^d6167ea0 / routing^e49d7603 /
+#     telephony^2618106d / video^094bf58d）⇒ feeds 也不会漂。所以不要去改 feeds.conf.default。
+#
+#  B. .config 改为从官方 config.buildinfo 派生（见 ax3000t-mt76-112m/ax3000t-mt76-112m-25.12.2.config）
+#     旧版手写 81 行 fragment ≈ 关掉了 CONFIG_ALL_KMODS
+#     ⇒ 数百个内核符号被写成 n ⇒ 内核配置与官方不同 ⇒ 哈希落到另一支
+#     ⇒ 官方 kmods 池全部不可用，硬装就是 net_generic() 空指针 panic。
+#     新版逐字保留官方 config 的设备/包选择，只做三处 delta
+#     （只勾 112M 这一台、关掉 TARGET_ALL_PROFILES、加 16 个要装进固件的包）。
+#
+#  C. ABI 门（本文件最关键的新增步骤）
+#     先只编内核，读出实际 .vermagic 与官方 b5b7729f… 对比，
+#     不一致就立刻停下（约 30 分钟出结果，而不是编了两个小时才发现）。
+#
+#  D. 顺手修掉的沉默失败点
+#     · 112M 补丁前置断言（112m-patch.sh 第 0 节，三条一起过才继续）：
+#       ① 上游 ubootmod 的 ubi 仍必须是 0x600000 + 0x7000000（我们与它同偏移）
+#       ② common dtsi 里 KF 分区仍必须从 0x7600000 开始（= 我们 ubi 的终点）
+#       ③ stock 的 ubi_kernel/ubi 分段仍是 0x600000+0x2200000 / 0x2800000+0x4e00000
+#       任一条不成立就立刻失败 —— 硬套会写到 KF 分区上，那是直接变砖。
+#     · 去掉重复的 Install feeds（旧版 install -a 跑了两遍）
+#     · .config 用显式存在性校验 + cp（旧版 `[ -e $CONFIG_FILE ] && mv` 一旦
+#       路径不对就是静默 no-op，然后你会在编出来的固件里发现配置完全没生效）
+#     · defconfig 之后加 sanity check（设备数必须正好 1 台、ALL_KMODS 必须在…）
+#     · 去掉 `|| make -j1 V=s`：多线程失败后再单线程重编，必然撞 6 小时上限
+#     · 加 permissions / timeout-minutes / artifact 的 if: always()
+#     · Release 补挂 config.buildinfo 与整包 kmods（ABI 一致时它就是官方池的镜像）
+#
+#  E. 25.12 上游两个已知陷阱（这一版都带兜底，不然"窄配置"必然踩）
+#     ① netgear FIT 的 rootfs 节点：filogic.mk 会为 target 里**每一台**设备生成
+#        <device>-kernel.bin，而 root.squashfs+pkg=$(ROOTFS_ID/<dev>) 只有被选中的
+#        设备才有（include/image.mk:610）⇒ 没勾选的 netgear 设备拿到不存在的路径，
+#        FIT 里出现 "value = ;" ⇒ mkimage 报 its:50.12-13 syntax error ⇒ 整个 world 挂。
+#        官方 release 用 TARGET_ALL_PROFILES=y（所有设备都被选中）所以碰不到；
+#        我们只勾一台 ⇒ 必须打兜底（112m-patch.sh 第 3 节）。
+#     ② 兜底补丁写回 scripts/gen_netgear_rootfs_node.sh 时若用 mv，会把该脚本的
+#        可执行位冲成 644，而 filogic.mk 是**直接执行**它的 ⇒ 镜像阶段
+#        "Permission denied / Error 126"。所以补丁里改成原地截断写回 + chmod 755，
+#        并且"修复可执行位"放在幂等分支之外（否则已坏的树永远修不好）。
+#     ③ 汇总产物那一步：bin/targets 不存在时不能 `set -e` 直接退出，
+#        否则日志与 artifact 全丢、真因被掩盖（第一轮云编译就是这么浪费掉的）。
+# =============================================================================
+
+name: immortalwrt_ax3000t_112m_25.12.2
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi_strict:
+        description: 'ABI 门：vermagic 与官方不一致时是否中止编译（true=中止）'
+        type: boolean
+        default: true
+  repository_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: v25.12.2
+  EXPECTED_KERNEL: '6.12.103'
+  EXPECTED_VERMAGIC: b5b7729ffbba3ecdd83f339de8fadfb8
+  EXPECTED_COMMIT: 4fc16f2985a358bd43bb522e43f05395fcbd6ed5
+  CONFIG_FILE: ax3000t-mt76-112m/ax3000t-mt76-112m-25.12.2.config
+  CUSTOMIZE_SCRIPT: ax3000t-mt76-112m/customize_ax3000t_112m-25.12.2.sh
+  SET_DEFAULT_WIFI: '1'   # 0 = 不写 WiFi 默认值（不改就不动，见定制脚本第 4 节）
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    # 22.04 是上游一直用的镜像，maximize-build-space 的 /builder 空间腾挪也是按它测的。
+    # 注意它已被标记弃用（2027-04-17 下线），将来换 24.04 时 /builder 逻辑要重测。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+
+      - name: 腾出磁盘空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          overprovision-lvm: 'true'
+          build-mount-path: '/builder'
+
+      - name: 准备 /builder 目录
+        run: |
+          sudo mkdir -p /builder
+          sudo chown "$USER:$GROUPS" /builder
+          df -hT /builder
+
+      - name: 检出本仓库
+        uses: actions/checkout@v7
+
+      - name: 安装编译依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # 官方唯一的依赖安装脚本（immortalwrt/build-scripts）。它每次都会拉最新，
+          # 这是唯一无法冻结的外部输入；真要冻结就把它的内容抄进本仓库再执行。
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo apt-get -y autoremove --purge
+          sudo apt-get -y clean
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo timedatectl set-timezone Asia/Shanghai
+          sudo chown -R "$USER:$GROUPS" "$GITHUB_WORKSPACE"
+          df -hT /builder
+
+      - name: 克隆源码（钉死 v25.12.2）
+        working-directory: /builder
+        run: |
+          set -euo pipefail
+          git clone -b "$REPO_BRANCH" --single-branch --filter=blob:none "$REPO_URL" /builder/openwrt
+          cd /builder/openwrt
+          echo "== 实际检出的 commit =="
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "$HEAD_SHA"
+          git log -1 --format='%H %ci %s'
+          echo "== tag 指向的 commit（应当与上面相同）=="
+          git rev-parse "$REPO_BRANCH^{commit}"
+          # 这一条只是取证：tag 被人挪过就会警告（正常情况永远不该触发）
+          if [ "$HEAD_SHA" != "$EXPECTED_COMMIT" ]; then
+            echo "::warning::$REPO_BRANCH 指向的 commit 与预期 $EXPECTED_COMMIT 不同，请核对上游 tag 是否被移动"
+          fi
+          echo "== feeds.conf.default（自带 ^commit 钉死，不要改）=="
+          cat feeds.conf.default
+
+      - name: 应用 AX3000T 112M 大分区补丁
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+
+          # 补丁逻辑只有一份：仓库 ax3000t-mt76-112m/112m-patch.sh（本地编译用的是同一个文件）。
+          # 为什么不把这堆内容内联在这份 yml 里（AX6000 那版是内联的）：
+          #   内联过就踩到"云端 yml 与本地脚本漂移"——本地验证的是脚本，
+          #   而云端跑的是另一份拷贝，任何一处改动都得同步改两个地方。
+          #   现在这一步只负责「搬运 + 执行 + 复核」，逻辑与本地永远一致。
+          #
+          # 脚本自己会做四件事（细节见文件头注释）：
+          #   0. 前置断言：上游 ubootmod 的 ubi 仍是 0x600000+0x7000000、
+          #      common dtsi 里 KF 仍从 0x7600000 开始、stock 的 ubi_kernel/ubi 分段没变
+          #   1. 新建 DTS mt7981b-xiaomi-mi-router-ax3000t-mtkuboot.dts（NMBM + 112 MiB ubi）
+          #   2. 在 filogic.mk 里注册 Device/xiaomi_mi-router-ax3000t-mtkuboot（锚点行之后插入）
+          #   3. netgear 空 rootfs 兜底 + 保住 gen_netgear_rootfs_node.sh 的可执行位
+          if [ ! -f "$GITHUB_WORKSPACE/ax3000t-mt76-112m/112m-patch.sh" ]; then
+            echo "::error::仓库 ax3000t-mt76-112m/ 里找不到 112m-patch.sh（上传时放在 ${SUB}/ 下）"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+          cp -v "$GITHUB_WORKSPACE/ax3000t-mt76-112m/112m-patch.sh" /builder/openwrt/
+          chmod +x ./112m-patch.sh
+          OPENWRT_DIR=/builder/openwrt ./112m-patch.sh
+
+          # 复核三样东西（脚本内部已自检，这里再独立看一眼，防止脚本被改动后静默通过）
+          echo "== 机型定义 =="
+          grep -n 'xiaomi_mi-router-ax3000t-mtkuboot' target/linux/mediatek/image/filogic.mk | head -n 4
+          echo "== DTS =="
+          ls -l target/linux/mediatek/dts/mt7981b-xiaomi-mi-router-ax3000t-mtkuboot.dts
+          echo "== netgear 兜底 =="
+          grep -n 'AX3000T-KIT: netgear-empty-rootfs-guard' -A 3 scripts/gen_netgear_rootfs_node.sh
+          echo "✅ AX3000T 112M 大分区适配代码补丁应用成功"
+
+      - name: 更新并安装 feeds
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config 并做定制
+        working-directory: /builder/openwrt
+        run: |
+          set -euo pipefail
+
+          # 1. 用官方 config.buildinfo 派生的 .config（缺失就报错，绝不静默跳过）
+          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
+            echo "::error::仓库里找不到 $CONFIG_FILE（应在 ax3000t-mt76-112m/ 下）"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+          cp -v "$GITHUB_WORKSPACE/$CONFIG_FILE" /builder/openwrt/.config
+
+          # 2. 定制脚本：默认 LAN IP / 主机名 / 默认主题 / uci-defaults 里的 WiFi 初值
+          #    （必须在 feeds install -a 之后跑，它要改 luci 集合的 Makefile）
+          cp -v "$GITHUB_WORKSPACE/$CUSTOMIZE_SCRIPT" /builder/openwrt/
+          CS_NAME="$(basename "$CUSTOMIZE_SCRIPT")"; chmod +x "$CS_NAME"
+          "./$CS_NAME"
+
+          # 3. 展开成完整 .config
+          make defconfig
+
+          # 4. sanity check：任何一条不过，说明配置没按预期生效，立刻停
+          echo "== 选中的设备 =="
+          grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config
+          N=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config)
+          echo "选中设备数 = $N"
+          [ "$N" -eq 1 ] || { echo "::error::选中设备数不是 1（TARGET_ALL_PROFILES 没关掉？）"; exit 1; }
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t-mtkuboot=y' .config \
+            || { echo "::error::112M 设备没被选中（filogic.mk 补丁没生效？机型名写错了？）"; exit 1; }
+          grep -q '^CONFIG_ALL_KMODS=y' .config \
+            || { echo "::error::ALL_KMODS 丢了 —— 内核 ABI 会与官方分家，这正是上一次 panic 的根因"; exit 1; }
+          grep -q '^CONFIG_TARGET_MULTI_PROFILE=y' .config \
+            || { echo "::error::MULTI_PROFILE 丢了"; exit 1; }
+          grep -q '^# CONFIG_TARGET_ALL_PROFILES is not set' .config \
+            || { echo "::error::TARGET_ALL_PROFILES 没关掉"; exit 1; }
+          for p in kmod-nft-queue kmod-nfnetlink-queue luci-theme-argon; do
+            grep -q "^CONFIG_PACKAGE_$p=y" .config || { echo "::error::$p 没被选中"; exit 1; }
+          done
+
+          # perf：24.10.6 那次云编译 2h59m 失败的直接原因（内核 6.6.133 的坏回溯补丁 —— tools/perf/util/unwind-libdw.c
+          # 调用了 map_symbol__exit()，而 map_symbol.c 在 6.6.133 里根本不存在，util/Build 里也没有 map_symbol.o）。
+          # 25.12.2 的内核换到 6.12.103，那个坏补丁多半已经不在了；但我们本来也不需要 perf，
+          # 关掉还能少编 libdw/libbfd/libopcodes/libctf/objdump 一串 staging 包。
+          # 注意：25.12 的 perf Makefile 里没有 NO_LIBDW 开关（libdw 是硬依赖），所以只能靠 is not set 关掉。
+          # 我们靠 config 里那行 `# CONFIG_PACKAGE_perf is not set` 把关掉它；这里验证那行真的生效 ——
+          # 因为 perf 带 PKG_FLAGS:=nonshared，理论上可能被 Kconfig 的 `default m if ALL_NONSHARED` 顶回来，
+          # 那样第三次跑还会在同一个地方倒（差别只是白等 3 小时）。
+          if grep -qE '^CONFIG_PACKAGE_perf=' .config; then
+            echo "::error::perf 仍被选中：$(grep -E '^CONFIG_PACKAGE_perf=' .config)"
+            echo "::error::说明 config 里那行 is not set 压不住 ALL_NONSHARED 的默认值，改走备选方案："
+            echo "::error::在『编译固件』之前 sed 给 package/devel/perf/Makefile 的 MAKE_FLAGS 加 NO_LIBDW=1（内核 perf 自己的开关，同样只影响这个包）"
+            exit 1
+          fi
+          grep -q '^# CONFIG_PACKAGE_perf is not set' .config \
+            || { echo "::error::config 里那行 # CONFIG_PACKAGE_perf is not set 不见了（被 defconfig 丢掉？）"; exit 1; }
+          echo "✅ perf 已关闭：不会编 package/devel/perf（24.10.6 的内核 6.6.133 那个坏回溯补丁碰不到；25.12.2 也少编一串 staging 包）"
+
+          echo "== 内核相关行数 =="
+          grep -c '^CONFIG_KERNEL_' .config
+          echo "== 明确装进固件的 kmod 数 =="
+          grep -cE '^CONFIG_PACKAGE_kmod-.*=y$' .config
+          echo "✅ .config 生成完毕"
+
+      - name: 下载所有源码包
+        working-directory: /builder/openwrt
+        run: |
+          set -uo pipefail
+          make download -j8 || make download -j1 V=s || true
+          echo "== 小于 1KB 的（= 下载失败）文件，列出来再删掉 =="
+          # -L 跟随软链、-type f 只认普通文件：dl 若是指向别处缓存的软链，
+          # 不加这两个参数会把「软链本身」当成 28 字节的失败文件、下一行的 -delete 会把它删掉
+          # （2026-10-14 本地套件踩过：dl 软链被自己删了，du 直接报错）
+          find -L dl -maxdepth 1 -type f -size -1024c -exec ls -l {} + 2>/dev/null | tee /builder/dl-broken.txt
+          find -L dl -maxdepth 1 -type f -size -1024c -delete 2>/dev/null || true
+          echo "== dl 目录大小 =="
+          du -sh dl
+
+      # 为什么要专门编工具链：
+      # include/toplevel.mk 里所有内核相关操作都显式依赖 `toolchain/install`
+      # （prepare_kernel_conf: .config toolchain/install），而通用 `%::` 规则只跑 `prereq`，
+      # 不会替你把交叉编译器装好；内核编译需要 $TARGET_CROSS 里的 gcc。
+      # 缺它时，错误发生在被 include/verbose.mk 静音的子 make 里 —— 日志上只剩
+      # "ERROR: target/linux failed to build."，看不到真正原因。
+      # 这一步的产物在后面的正式编译里会被复用，不是额外开销。
+      - name: 编译工具链（ABI 门与正式编译共用）
+        working-directory: /builder/openwrt
+        run: |
+          set +e
+          echo "$(nproc) 线程编译工具链；完整日志 → /builder/toolchain.log，控制台只显示进度与错误"
+          make -j$(nproc) V=s tools/install toolchain/install 2>&1 | tee /builder/toolchain.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "工具链 make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found|Cannot' /builder/toolchain.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 120 行"
+            tail -n 120 /builder/toolchain.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+
+      - name: ABI 门 — 只编内核，核对 vermagic
+        working-directory: /builder/openwrt
+        run: |
+          set +e
+          grep '^CONFIG_KERNEL_' .config | LC_ALL=C sort | tee /builder/kernel-config-lines.txt | head -n 40
+          # V=s 是必须的：include/verbose.mk 在非 verbose 下把子 make 的 stdout/stderr 整体
+          # 重定向到 /dev/null（SILENT:=>/dev/null 2>&1），只放行 MESSAGE 那几条
+          # " make[N] -C dir target" 进度行 ⇒ 失败时真正的原因会被吞掉。
+          # 触发 Kernel/Configure ⇒ 写出 .vermagic（哈希的三条输入全在这里汇聚）
+          make -j$(nproc) V=s target/linux/compile 2>&1 | tee /builder/abi-gate.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "内核 make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found|Cannot|unrecognized' /builder/abi-gate.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 200 行"
+            tail -n 200 /builder/abi-gate.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+          VFILE=$(find build_dir -maxdepth 6 -name .vermagic -path '*mediatek*' | head -n1)
+          [ -n "$VFILE" ] || { echo "::error::没有找到 .vermagic"; exit 1; }
+          V=$(cat "$VFILE")
+          # 把这三行证据写成文件、随 artifact 上传：运行页面上的控制台输出会过期，
+          # artifact 可以离线反复核对（2026-10-12 那次失败就只能靠"跑过了门"反推）。
+          cp -v "$VFILE" /builder/dot-vermagic.txt
+          {
+            echo "==== ABI 门取证 ===="
+            echo "构建时间(北京时间) : $(TZ=Asia/Shanghai date -Is)"
+            echo "源码 tag / commit  : $REPO_BRANCH / $(git -C /builder/openwrt rev-parse HEAD)"
+            echo ".config sha256     : $(sha256sum .config | cut -d' ' -f1)"
+            echo ".vermagic 文件     : $VFILE"
+            echo "实际 vermagic      : $V"
+            echo "官方 vermagic      : $EXPECTED_VERMAGIC"
+            echo "期望内核版本       : $EXPECTED_KERNEL"
+            echo "结论               : $([ "$V" = "$EXPECTED_VERMAGIC" ] && echo 与官方一致 || echo 与官方不一致)"
+          } | tee /builder/vermagic.txt
+          echo ".vermagic 文件 : $VFILE"
+          echo "实际 vermagic  : $V"
+          echo "官方 vermagic  : $EXPECTED_VERMAGIC  (内核 $EXPECTED_KERNEL)"
+          if [ "$V" = "$EXPECTED_VERMAGIC" ]; then
+            echo "✅ ABI 与官方一致 —— 官方 v25.12.2 的 1120 个 kmod 可以直接 apk add 装"
+          else
+            echo "::warning::vermagic 与官方不一致 —— 官方 kmods 池不可用（硬装会 panic）"
+            echo "::warning::固件本身仍然能用，但插件只能全部用本次编译产物"
+            if [ "${{ inputs.abi_strict }}" != "false" ]; then
+              echo "::error::abi_strict=true，中止编译。请对比 /builder/kernel-config-lines.txt 与官方 config.buildinfo 的 CONFIG_KERNEL_* 行"
+              exit 1
+            fi
+          fi
+
+      - name: 编译固件
+        working-directory: /builder/openwrt
+        run: |
+          set +e
+          echo "$(nproc) 线程编译；完整日志 → /builder/build.log，控制台只显示进度与错误"
+          make -j$(nproc) V=s 2>&1 | tee /builder/build.log \
+            | grep --line-buffered -E '^ *make\[[0-9]+\]|Error [0-9]+|error:|\*\*\* |No space left|Killed|not found'
+          rc=${PIPESTATUS[0]}
+          echo "make 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::错误摘要"
+            grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|undefined reference|unrecognized|not found|Cannot install' /builder/build.log | tail -n 80 || true
+            echo "::endgroup::"
+            echo "::group::日志尾部 200 行"
+            tail -n 200 /builder/build.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+
+      - name: 编译失败时打印各段日志的错误行
+        if: failure()
+        run: |
+          for f in /builder/abi-gate.log /builder/toolchain.log /builder/build.log; do
+            if [ -s "$f" ]; then
+              echo "::group::$f"
+              grep -nE 'Error [0-9]+|error:|fatal|No space left|Killed|not found' "$f" | tail -n 40 || true
+              tail -n 40 "$f" || true
+              echo "::endgroup::"
+            fi
+          done
+
+      - name: 汇总产物（含 kmods 池与 config.buildinfo）
+        if: always()
+        working-directory: /builder/openwrt
+        run: |
+          # 这一步是「收尸」：正式编译倒了也要把日志与已有产物收上来。
+          # 所以刻意不用 set -e —— 2026-10-13 第一次 25.12 编译失败时，bin/targets 不存在，
+          # find 直接以 1 退出，控制台只剩一句 find: 'bin/targets': No such file or directory，
+          # 真正的失败原因（更早的步骤）反而被它盖住了。
+          set -uo pipefail
+          if [ ! -d bin/targets ]; then
+            echo "::error::bin/targets 不存在 ⇒ 正式编译没有产出任何镜像，真正的失败在更早的步骤"
+            echo "::group::ABI 门 / 各段日志的关键行"
+            grep -nE 'ABI|vermagic|结论|一致|Error [0-9]+|error:|fatal|No space left|Killed|not found' /builder/abi-gate.log 2>/dev/null | tail -n 25 || true
+            echo "::endgroup::"
+            for f in /builder/abi-gate.log /builder/toolchain.log /builder/build.log; do
+              [ -s "$f" ] || continue
+              echo "::group::$f 尾部 40 行"
+              tail -n 40 "$f" || true
+              echo "::endgroup::"
+            done
+            echo "（上传 artifact 那一步会把完整日志一并交出：abi-gate.log / toolchain.log / build.log / vermagic.txt / dot-vermagic.txt / kernel-config-lines.txt）"
+            exit 0
+          fi
+          TDIR=$(find bin/targets -maxdepth 2 -mindepth 2 -type d | head -n1)
+          echo "target 目录: $TDIR"
+          ls -lh "$TDIR" || true
+          if [ -d "$TDIR/kmods" ]; then
+            echo "== kmods 包数 =="
+            find "$TDIR/kmods" \( -name '*.ipk' -o -name '*.apk' \) | wc -l
+            tar -czf /builder/ax3000t-112m-kmods.tar.gz -C "$TDIR" kmods
+            ls -lh /builder/ax3000t-112m-kmods.tar.gz
+          else
+            echo "::warning::没有 kmods 目录"
+          fi
+          cp -v "$TDIR/config.buildinfo" /builder/ 2>/dev/null || true
+          cp -v "$TDIR/profiles.json" /builder/ 2>/dev/null || true
+          echo "== 本次实际 .config 的 sha256 =="
+          sha256sum .config
+          cat "$TDIR"/*.vermagic 2>/dev/null || true
+          echo "== bin 目录大小 =="
+          du -sh bin
+          echo "== 各段日志体积 =="
+          ls -lh /builder/*.log 2>/dev/null || true
+
+      - name: 校验产物（UBI 结构 / board_name / 内核 ABI）
+        if: success()
+        working-directory: /builder/openwrt
+        run: |
+          # 这一步是"上机前的体检"：把三件最容易出、而且上机才发现的事挡在这里 ——
+          #   ① factory.bin 不是 UBI 镜像 / 不是 128 KiB 整数倍 / 超过 112 MiB 的 ubi 分区
+          #      ⇒ U-Boot WebUI 要么不认、要么写到 KF 分区上
+          #   ② sysupgrade.bin 的 BOARD 与机型名不一致 ⇒ 系统内升级会被拒（配置也保不住）
+          #   ③ manifest 里的内核不是官方那一支 ⇒ 官方 1120 个 kmod 池全部不可用
+          set -uo pipefail
+          TDIR=$(find bin/targets -maxdepth 2 -mindepth 2 -type d | head -n1)
+          [ -n "$TDIR" ] || { echo "::error::找不到 target 目录"; exit 1; }
+          FAIL=0
+
+          echo "== ① factory.bin（U-Boot WebUI 刷的那份）=="
+          FAC=$(ls "$TDIR"/*squashfs-factory.bin 2>/dev/null | head -n1)
+          if [ -z "$FAC" ]; then
+            echo "::error::没有 factory.bin（U-Boot WebUI 刷机必须有它）"; FAIL=1
+          else
+            SZ=$(stat -c%s "$FAC")
+            MAGIC=$(head -c 4 "$FAC" | od -An -tx1 | tr -d ' \n')
+            echo "$FAC : $SZ bytes, 头 4 字节 = $MAGIC"
+            [ "$MAGIC" = "55424923" ] || { echo "::error::头 4 字节不是 UBI#（应为 55424923），U-Boot 不会认这份镜像"; FAIL=1; }
+            [ $((SZ % 131072)) -eq 0 ] || { echo "::error::不是 128 KiB 的整数倍（$SZ），UBI 镜像必须按 PEB 对齐"; FAIL=1; }
+            PEB=$((SZ / 131072))
+            echo "PEB 数 = $PEB（112 MiB 分区上限 880）"
+            [ "$PEB" -le 880 ] || { echo "::error::超出 112 MiB 的 ubi 分区（0x600000 + 0x7000000）"; FAIL=1; }
+            for v in kernel rootfs rootfs_data; do
+              if grep -aq "$v" "$FAC"; then echo "✅ UBI 卷表含 $v 卷"; else echo "::error::UBI 卷表里找不到 $v 卷"; FAIL=1; fi
+            done
+          fi
+
+          echo "== ② sysupgrade.bin（系统内就地升级 / LuCI 更新固件）=="
+          SYS=$(ls "$TDIR"/*squashfs-sysupgrade.bin 2>/dev/null | head -n1)
+          if [ -z "$SYS" ]; then
+            echo "::warning::没有 sysupgrade.bin（只有 factory.bin 也能从 U-Boot WebUI 刷）"
+          else
+            echo "$SYS : $(stat -c%s "$SYS") bytes"
+            BOARD=$(tar -xOf "$SYS" sysupgrade-*/CONTROL 2>/dev/null | grep -m1 '^BOARD=' || true)
+            echo "CONTROL 里: $BOARD"
+            [ "$BOARD" = "BOARD=xiaomi_mi-router-ax3000t-mtkuboot" ] \
+              || { echo "::error::BOARD 不是 xiaomi_mi-router-ax3000t-mtkuboot ⇒ 本机 sysupgrade 会拒绝（board_name 对不上）"; FAIL=1; }
+          fi
+
+          echo "== ③ manifest 里的内核 ABI =="
+          MAN=$(ls "$TDIR"/*.manifest 2>/dev/null | head -n1)
+          if [ -z "$MAN" ]; then
+            echo "::error::没有 manifest"; FAIL=1
+          else
+            grep -n '^kernel - ' "$MAN" || true
+            grep -q "kernel - $EXPECTED_KERNEL~$EXPECTED_VERMAGIC" "$MAN" \
+              || { echo "::error::manifest 里的内核不是 $EXPECTED_KERNEL~$EXPECTED_VERMAGIC ⇒ 官方 kmods 池不可用"; FAIL=1; }
+          fi
+
+          [ "$FAIL" -eq 0 ] || { echo "::error::产物校验未通过，不要刷机"; exit 1; }
+          echo "✅ 产物校验通过：UBI 结构 / board_name / 内核 ABI 三项都对"
+
+      - name: 上传 artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ax3000t-112m-25.12.2-${{ github.run_number }}
+          path: |
+            /builder/openwrt/bin/targets/mediatek/filogic/*.bin
+            /builder/openwrt/bin/targets/mediatek/filogic/*.itb
+            /builder/openwrt/bin/targets/mediatek/filogic/*.manifest
+            /builder/openwrt/bin/targets/mediatek/filogic/*.json
+            /builder/openwrt/bin/targets/mediatek/filogic/config.buildinfo
+            /builder/ax3000t-112m-kmods.tar.gz
+            /builder/abi-gate.log
+            /builder/toolchain.log
+            /builder/build.log
+            /builder/dl-broken.txt
+            /builder/kernel-config-lines.txt
+            /builder/vermagic.txt
+            /builder/dot-vermagic.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 生成构建时间戳
+        if: success()
+        run: echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: 发布 Release
+        if: success()
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.BUILD_DATE }}
+          name: AX3000T_112m_v25.12.2_${{ env.BUILD_DATE }}
+          generate_release_notes: false
+          body: |
+            小米 AX3000T · ImmortalWrt v25.12.2 (4fc16f29) · yuzhii/hanwckf MTK U-Boot 112M 大分区布局
+
+            刷机（两种都行，按当前状态选）：
+            1) 从 U-Boot WebUI：showlayout 里选 **immortalwrt-112m** → 刷 factory.bin
+               （⚠ showlayout 一定要选 112m/immortalwrt-112m；选错布局会写到别的分区上，那是唯一会变砖的操作）
+            2) 系统内就地升级（当前跑着 24.10 的 mtkuboot 版固件时）：LuCI「系统 → 更新固件」
+               或 ssh `sysupgrade -k -v <sysupgrade.bin>`；不勾"保留配置"则先用 `sysupgrade -b` 备份。
+            刷完第一次启动后建议核对：`cat /tmp/sysinfo/board_name` 应为 xiaomi,mi-router-ax3000t-mtkuboot。
+
+            - config.buildinfo：本次构建的实际配置，下次要复现就从它派生
+            - ax3000t-112m-kmods.tar.gz：本次构建的全部 kmod
+              （vermagic 与官方一致时，内容与官方 kmods 池等价，可互相替代）
+          files: |
+            /builder/openwrt/bin/targets/mediatek/filogic/*.bin
+            /builder/openwrt/bin/targets/mediatek/filogic/*.manifest
+            /builder/openwrt/bin/targets/mediatek/filogic/*.json
+            /builder/openwrt/bin/targets/mediatek/filogic/config.buildinfo
+            /builder/ax3000t-112m-kmods.tar.gz
