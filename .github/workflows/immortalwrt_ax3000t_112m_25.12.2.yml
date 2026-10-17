@@ -172,7 +172,8 @@ jobs:
           #   2. 在 filogic.mk 里注册 Device/xiaomi_mi-router-ax3000t-mtkuboot（锚点行之后插入）
           #   3. netgear 空 rootfs 兜底 + 保住 gen_netgear_rootfs_node.sh 的可执行位
           if [ ! -f "$GITHUB_WORKSPACE/ax3000t-mt76-112m/112m-patch.sh" ]; then
-            echo "::error::仓库 ax3000t-mt76-112m/ 里找不到 112m-patch.sh（上传时放在 ${SUB}/ 下）"
+            echo "::error::仓库 ax3000t-mt76-112m/ 里找不到 112m-patch.sh（上传时把它放在仓库的 ax3000t-mt76-112m/ 目录下）"
+            ls -la "$GITHUB_WORKSPACE/ax3000t-mt76-112m" 2>/dev/null || true
             ls -la "$GITHUB_WORKSPACE"
             exit 1
           fi
@@ -204,6 +205,7 @@ jobs:
           # 1. 用官方 config.buildinfo 派生的 .config（缺失就报错，绝不静默跳过）
           if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
             echo "::error::仓库里找不到 $CONFIG_FILE（应在 ax3000t-mt76-112m/ 下）"
+            ls -la "$GITHUB_WORKSPACE/ax3000t-mt76-112m" 2>/dev/null || true
             ls -la "$GITHUB_WORKSPACE"
             exit 1
           fi
@@ -410,13 +412,31 @@ jobs:
           TDIR=$(find bin/targets -maxdepth 2 -mindepth 2 -type d | head -n1)
           echo "target 目录: $TDIR"
           ls -lh "$TDIR" || true
-          if [ -d "$TDIR/kmods" ]; then
-            echo "== kmods 包数 =="
-            find "$TDIR/kmods" \( -name '*.ipk' -o -name '*.apk' \) | wc -l
-            tar -czf /builder/ax3000t-112m-kmods.tar.gz -C "$TDIR" kmods
+          # kmods 池 = 以后还能装插件的那个仓库。位置随版本变：
+          #   24.10 及更早：$TDIR/kmods/<内核版本-哈希>/*.ipk
+          #   25.12 起（apk）：kmod 与普通包同放在 $TDIR/packages/，索引是 packages.adb + index.json
+          # 2026-10-14 发现：旧写法只看 $TDIR/kmods，在 25.12 上永远走 else ⇒ 仓库被静默丢掉。
+          KMOD_SRC=""
+          if [ -d "$TDIR/kmods" ]; then KMOD_SRC="$TDIR/kmods"
+          elif [ -d "$TDIR/packages" ]; then KMOD_SRC="$TDIR/packages"; fi
+          if [ -n "$KMOD_SRC" ]; then
+            STAGE=/builder/.kmods-stage
+            rm -rf "$STAGE"; mkdir -p "$STAGE/kmods"
+            find "$KMOD_SRC" -maxdepth 1 \( -name 'kmod-*.ipk' -o -name 'kmod-*.apk' \) \
+              -exec cp -t "$STAGE/kmods" {} + 2>/dev/null || true
+            for f in packages.adb packages.adb.sig index.json Packages Packages.gz Packages.manifest; do
+              if [ -f "$KMOD_SRC/$f" ]; then cp -f "$KMOD_SRC/$f" "$STAGE/kmods/"; fi
+            done
+            KC=$(find "$STAGE/kmods" -maxdepth 1 -name 'kmod-*' | wc -l)
+            echo "== kmods 包数 = $KC（来源：$KMOD_SRC）=="
+            if [ "$KC" -lt 100 ]; then
+              echo "::warning::kmods 包数偏少（$KC）—— ALL_KMODS 可能没生效（官方池 1120 个）"
+            fi
+            tar -czf /builder/ax3000t-112m-kmods.tar.gz -C "$STAGE" kmods
+            rm -rf "$STAGE"
             ls -lh /builder/ax3000t-112m-kmods.tar.gz
           else
-            echo "::warning::没有 kmods 目录"
+            echo "::warning::既没有 $TDIR/kmods 也没有 $TDIR/packages"
           fi
           cp -v "$TDIR/config.buildinfo" /builder/ 2>/dev/null || true
           cp -v "$TDIR/profiles.json" /builder/ 2>/dev/null || true
@@ -466,7 +486,17 @@ jobs:
             echo "::warning::没有 sysupgrade.bin（只有 factory.bin 也能从 U-Boot WebUI 刷）"
           else
             echo "$SYS : $(stat -c%s "$SYS") bytes"
-            BOARD=$(tar -xOf "$SYS" sysupgrade-*/CONTROL 2>/dev/null | grep -m1 '^BOARD=' || true)
+            # 2026-10-14 云上踩到：原来是 `tar -xOf "$SYS" sysupgrade-*/CONTROL`，GNU tar 在“提取”
+            # 时默认不按通配符匹配模式名（那是 --list/--wildcards 的行为），于是取不到 CONTROL、
+            # BOARD 变空、被误判成“BOARD 不对”而拦下（构建其实完全成功）。
+            # 改成：先 tar -tf 拿到确切的成员名，再按精确成员名提取。
+            MEMBER=$(tar -tf "$SYS" 2>/dev/null | grep -m1 '/CONTROL$' || true)
+            echo "   CONTROL 成员: ${MEMBER:-<没找到>}"
+            if [ -z "$MEMBER" ]; then
+              echo "::warning::tar 列表里没有 CONTROL，成员清单前 5 行如下（供排查）："
+              tar -tf "$SYS" 2>/dev/null | head -5 || true
+            fi
+            BOARD=$(tar -xOf "$SYS" "$MEMBER" 2>/dev/null | tr -d '\r' | grep -m1 '^BOARD=' || true)
             echo "CONTROL 里: $BOARD"
             [ "$BOARD" = "BOARD=xiaomi_mi-router-ax3000t-mtkuboot" ] \
               || { echo "::error::BOARD 不是 xiaomi_mi-router-ax3000t-mtkuboot ⇒ 本机 sysupgrade 会拒绝（board_name 对不上）"; FAIL=1; }
